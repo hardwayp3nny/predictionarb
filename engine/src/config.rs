@@ -31,7 +31,7 @@ impl Default for EngineConfig {
             },
             ws: WsConfig {
                 market_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string(),
-                user_ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/user".to_string(),
+                user_ws_url: "wss://ws-live-data.polymarket.com".to_string(),
                 max_assets_per_conn: 500,
             },
             worker_threads: num_cpus::get().max(2),
