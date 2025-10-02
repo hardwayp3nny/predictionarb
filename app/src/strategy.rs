@@ -1,5 +1,6 @@
+use alloy_primitives::U256;
 use alloy_signer_local::PrivateKeySigner;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use engine::{
     auth::{create_or_derive_api_creds, ApiCreds},
@@ -7,7 +8,14 @@ use engine::{
     eip712_sign::parse_pk,
     http_exchange::PolymarketHttpExchange,
     http_pool::HttpPool,
-    model::{BookSnapshot, DepthUpdate, Level, OrderBook, Side},
+    model::{
+        BookSnapshot, CancelAck, DepthUpdate, Level, OpenOrder, OrderAck, OrderArgs, OrderBook,
+        OrderType, OrderUpdate, Side, UserEvent, UserTrade,
+    },
+    oms::OrderManager,
+    order_builder::{prepare_signed_order, PreparedOrder},
+    order_types::{CreateOrderOptionsRs, SigType},
+    ports::{ExchangeClient, OrdersSnapshot, PositionsSnapshot},
     strategy::Strategy,
 };
 use futures::future::try_join_all;
@@ -19,6 +27,7 @@ use std::{
     convert::TryFrom,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 use tokio::{fs, sync::RwLock};
 use tracing::{error, warn};
@@ -209,19 +218,32 @@ struct AppConfig {
     symbols: Vec<SymbolConfig>,
 }
 
-#[allow(dead_code)]
 struct StrategyRuntime {
-    signer: PrivateKeySigner,
-    api_creds: ApiCreds,
-    http_pool: Arc<HttpPool>,
-    registry: Arc<Registry>,
+    signer: Arc<PrivateKeySigner>,
+    api_creds: Arc<ApiCreds>,
     tokens: Vec<ArbitrageToken>,
     combos: HashMap<String, Vec<ArbitrageToken>>,
     books: HashMap<String, Arc<RwLock<Option<OrderBook>>>>,
     aggregator: OrderBookAggregator,
+    exchange: Arc<PolymarketHttpExchange>,
+    order_managers: HashMap<String, OrderManager>,
     chain_id: u64,
     browser_address: Option<String>,
     rpc_url: Option<String>,
+    _registry: Arc<Registry>,
+}
+
+impl StrategyRuntime {
+    fn ensure_order_manager(&mut self, token_id: &str) -> OrderManager {
+        self.order_managers
+            .entry(token_id.to_string())
+            .or_insert_with(OrderManager::new)
+            .clone()
+    }
+
+    fn get_order_manager(&self, token_id: &str) -> Option<OrderManager> {
+        self.order_managers.get(token_id).cloned()
+    }
 }
 
 #[derive(Clone)]
@@ -229,6 +251,7 @@ pub struct ArbitrageStrategy {
     config_path: PathBuf,
     runtime: Arc<RwLock<Option<StrategyRuntime>>>,
     preloaded_api_creds: Arc<RwLock<Option<ApiCreds>>>,
+    pending_orders: Arc<RwLock<HashMap<String, PreparedOrder>>>,
 }
 
 impl ArbitrageStrategy {
@@ -237,6 +260,7 @@ impl ArbitrageStrategy {
             config_path: config_path.into(),
             runtime: Arc::new(RwLock::new(None)),
             preloaded_api_creds: Arc::new(RwLock::new(None)),
+            pending_orders: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -254,8 +278,7 @@ impl ArbitrageStrategy {
         let fallback_api_creds = cfg.api_creds.clone().map(ApiCreds::from);
         let pool_cfg = cfg.pool.clone();
 
-        let signer = parse_pk(&client_cfg.private_key).context("parse private key")?;
-        let registry = Arc::new(Registry::new());
+        let signer = Arc::new(parse_pk(&client_cfg.private_key).context("parse private key")?);
         let mut engine_cfg = EngineConfig::default();
         engine_cfg.http.base_url = client_cfg.host.clone();
         if let Some(pool_cfg) = pool_cfg.as_ref() {
@@ -267,6 +290,7 @@ impl ArbitrageStrategy {
             }
         }
 
+        let registry = Arc::new(Registry::new());
         let http_pool =
             Arc::new(HttpPool::new(&engine_cfg, registry.as_ref()).context("create http pool")?);
 
@@ -278,7 +302,8 @@ impl ArbitrageStrategy {
         let api_creds = if let Some(creds) = preset_api_creds {
             creds
         } else {
-            let result = create_or_derive_api_creds(http_pool.as_ref(), &signer, None).await;
+            let result =
+                create_or_derive_api_creds(http_pool.as_ref(), signer.as_ref(), None).await;
             let creds = match result {
                 Ok(creds) => creds,
                 Err(err) => {
@@ -300,35 +325,33 @@ impl ArbitrageStrategy {
             creds
         };
 
+        let api_creds_arc = Arc::new(api_creds);
+
         let mut tokens: Vec<ArbitrageToken> = cfg
             .symbols
             .into_iter()
             .map(ArbitrageToken::try_from)
             .collect::<Result<Vec<_>>>()?;
 
+        let exchange = Arc::new(PolymarketHttpExchange::new(
+            Arc::clone(&http_pool),
+            (*signer).clone(),
+            (*api_creds_arc).clone(),
+            client_cfg.chain_id,
+            client_cfg.browser_address.clone(),
+        ));
+
         let mut aggregator = OrderBookAggregator::new();
         let token_ids: Vec<String> = tokens.iter().map(|t| t.token_id.clone()).collect();
         let mut initial_books: HashMap<String, BookSnapshot> = HashMap::new();
         if !token_ids.is_empty() {
-            let exchange_http = Arc::new(PolymarketHttpExchange::new(
-                Arc::clone(&http_pool),
-                signer.clone(),
-                ApiCreds {
-                    api_key: api_creds.api_key.clone(),
-                    secret: api_creds.secret.clone(),
-                    passphrase: api_creds.passphrase.clone(),
-                },
-                client_cfg.chain_id,
-                client_cfg.browser_address.clone(),
-            ));
-
             let chunked_ids: Vec<Vec<String>> = token_ids
                 .chunks(BOOKS_BATCH_LIMIT)
                 .map(|chunk| chunk.to_vec())
                 .collect();
 
             let fetches = chunked_ids.into_iter().map(|chunk| {
-                let client = Arc::clone(&exchange_http);
+                let client = Arc::clone(&exchange);
                 async move { client.fetch_books(chunk.as_slice()).await }
             });
 
@@ -379,21 +402,35 @@ impl ArbitrageStrategy {
                 asset_ids.push(token.token_id.clone());
             }
         }
+
+        let mut order_managers: HashMap<String, OrderManager> = HashMap::new();
+        for token in &tokens {
+            order_managers
+                .entry(token.token_id.clone())
+                .or_insert_with(OrderManager::new);
+        }
         let runtime = StrategyRuntime {
             signer,
-            api_creds: api_creds.clone(),
-            http_pool,
-            registry,
+            api_creds: Arc::clone(&api_creds_arc),
             tokens: tokens.clone(),
             combos,
             books,
             aggregator,
+            exchange,
+            order_managers,
             chain_id: client_cfg.chain_id,
             browser_address: client_cfg.browser_address,
             rpc_url: client_cfg.rpc_url,
+            _registry: registry,
         };
 
         *self.runtime.write().await = Some(runtime);
+        let sync_strategy = self.clone();
+        tokio::spawn(async move {
+            sync_strategy
+                .sync_orders_positions_loop(Duration::from_secs(5))
+                .await;
+        });
         Ok(asset_ids)
     }
 
@@ -411,7 +448,7 @@ impl ArbitrageStrategy {
             .read()
             .await
             .as_ref()
-            .map(|rt| rt.api_creds.clone())
+            .map(|rt| rt.api_creds.as_ref().clone())
     }
 
     pub async fn handle_order_book(&self, snapshot: OrderBook) {
@@ -480,6 +517,213 @@ impl ArbitrageStrategy {
         }
         agg_snapshot
     }
+
+    async fn ensure_order_manager(&self, token_id: &str) -> Option<OrderManager> {
+        let mut guard = self.runtime.write().await;
+        guard.as_mut().map(|rt| rt.ensure_order_manager(token_id))
+    }
+
+    async fn get_order_manager(&self, token_id: &str) -> Option<OrderManager> {
+        let guard = self.runtime.read().await;
+        guard.as_ref().and_then(|rt| rt.get_order_manager(token_id))
+    }
+
+    pub async fn build_limit_order(
+        &self,
+        token_identifier: &str,
+        side: Side,
+        price: f64,
+        size: f64,
+        order_type: OrderType,
+        expiration: Option<u64>,
+    ) -> Result<String> {
+        let prepared = {
+            let guard = self.runtime.read().await;
+            let rt = guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("strategy runtime not initialized"))?;
+            let token = rt
+                .tokens
+                .iter()
+                .find(|t| t.token_id == token_identifier || t.symbol == token_identifier)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown token: {}", token_identifier))?;
+            let args = OrderArgs {
+                token_id: token.token_id.clone(),
+                price,
+                size,
+                side,
+            };
+            prepare_signed_order(
+                rt.signer.as_ref(),
+                rt.chain_id,
+                args,
+                order_type,
+                CreateOrderOptionsRs {
+                    tick_size: Some(token.tick_size),
+                    neg_risk: Some(token.neg_risk),
+                },
+                expiration.unwrap_or(0),
+                0,
+                U256::from(0u8),
+                "0x0000000000000000000000000000000000000000",
+                rt.browser_address.as_deref(),
+                SigType::PolyGnosisSafe,
+            )?
+        };
+
+        let order_id = prepared.signed.order_id.clone();
+        let mut guard = self.pending_orders.write().await;
+        guard.insert(order_id.clone(), prepared);
+        Ok(order_id)
+    }
+
+    pub async fn post_order(&self, order_id: &str) -> Result<OrderAck> {
+        let prepared = {
+            let guard = self.pending_orders.read().await;
+            guard
+                .get(order_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("order {} not prepared", order_id))?
+        };
+
+        let (exchange, manager) = {
+            let mut guard = self.runtime.write().await;
+            let rt = guard
+                .as_mut()
+                .ok_or_else(|| anyhow!("strategy runtime not initialized"))?;
+            let mgr = rt.ensure_order_manager(&prepared.args.token_id);
+            (Arc::clone(&rt.exchange), mgr)
+        };
+
+        manager.upsert_pending(prepared.signed.order_id.clone(), &prepared.args);
+        let ack = exchange.submit_prepared_order(&prepared).await?;
+        manager.on_ack(&ack);
+
+        if ack.success {
+            let ack_id = ack.order_id.clone();
+            let mut guard = self.pending_orders.write().await;
+            guard.remove(order_id);
+            if let Some(actual) = ack_id {
+                if actual != order_id {
+                    guard.remove(&actual);
+                }
+            }
+        }
+
+        Ok(ack)
+    }
+
+    pub async fn cancel_orders(&self, ids: Vec<String>) -> Result<CancelAck> {
+        if ids.is_empty() {
+            return Ok(CancelAck {
+                canceled: vec![],
+                not_canceled: vec![],
+            });
+        }
+        let exchange = {
+            let guard = self.runtime.read().await;
+            let rt = guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("strategy runtime not initialized"))?;
+            Arc::clone(&rt.exchange)
+        };
+        let ack = exchange.cancel_orders(ids.clone()).await?;
+        if !ack.canceled.is_empty() {
+            let mut guard = self.pending_orders.write().await;
+            for id in &ack.canceled {
+                guard.remove(id);
+            }
+        }
+        Ok(ack)
+    }
+
+    pub async fn list_orders(&self, token_id: &str) -> Vec<OpenOrder> {
+        if let Some(manager) = self.get_order_manager(token_id).await {
+            manager.list_by_asset(token_id)
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn sync_orders_once(&self) -> Result<()> {
+        let exchange = {
+            let guard = self.runtime.read().await;
+            match guard.as_ref() {
+                Some(rt) => Arc::clone(&rt.exchange),
+                None => return Ok(()),
+            }
+        };
+        let orders = OrdersSnapshot::fetch_orders(exchange.as_ref()).await?;
+        let mut guard = self.runtime.write().await;
+        if let Some(rt) = guard.as_mut() {
+            let known: HashSet<String> = rt.tokens.iter().map(|t| t.token_id.clone()).collect();
+            for order in orders.into_iter() {
+                if known.contains(&order.asset_id) {
+                    let manager = rt.ensure_order_manager(&order.asset_id);
+                    manager.upsert_snapshot(order);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_positions_once(&self) -> Result<()> {
+        let exchange = {
+            let guard = self.runtime.read().await;
+            match guard.as_ref() {
+                Some(rt) => Arc::clone(&rt.exchange),
+                None => return Ok(()),
+            }
+        };
+        let positions = PositionsSnapshot::fetch_positions(exchange.as_ref()).await?;
+        let mut guard = self.runtime.write().await;
+        if let Some(rt) = guard.as_mut() {
+            let known: HashSet<String> = rt.tokens.iter().map(|t| t.token_id.clone()).collect();
+            for pos in positions.into_iter() {
+                if known.contains(&pos.asset_id) {
+                    let manager = rt.ensure_order_manager(&pos.asset_id);
+                    manager.set_position(pos);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn sync_orders_positions_loop(self, interval: Duration) {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            if let Err(err) = self.sync_orders_once().await {
+                warn!(?err, "sync orders via REST failed");
+            }
+            if let Err(err) = self.sync_positions_once().await {
+                warn!(?err, "sync positions via REST failed");
+            }
+        }
+    }
+
+    async fn handle_order_update(&self, event: OrderUpdate) {
+        if let Some(manager) = self.ensure_order_manager(&event.asset_id).await {
+            let evt = UserEvent::Order(event.clone());
+            manager.on_user_event(&evt);
+        }
+        let status = event.status.to_uppercase();
+        if matches!(
+            status.as_str(),
+            "MATCHED" | "CANCELLED" | "CANCELED" | "REJECTED"
+        ) {
+            let mut guard = self.pending_orders.write().await;
+            guard.remove(&event.id);
+        }
+    }
+
+    async fn handle_user_trade(&self, event: UserTrade) {
+        if let Some(manager) = self.ensure_order_manager(&event.asset_id).await {
+            let evt = UserEvent::Trade(event);
+            manager.on_user_event(&evt);
+        }
+    }
 }
 
 #[async_trait]
@@ -500,5 +744,13 @@ impl Strategy for ArbitrageStrategy {
 
     async fn on_depth_update(&self, event: DepthUpdate) {
         self.handle_depth_update(event).await;
+    }
+
+    async fn on_order_update(&self, event: OrderUpdate) {
+        self.handle_order_update(event).await;
+    }
+
+    async fn on_user_trade(&self, event: UserTrade) {
+        self.handle_user_trade(event).await;
     }
 }

@@ -2,7 +2,7 @@ use crate::{
     auth::{create_l2_headers, ApiCreds},
     http_pool::HttpPool,
     model::*,
-    order_builder::build_signed_order,
+    order_builder::{build_signed_order, PreparedOrder},
     order_types::{CreateOrderOptionsRs, SigType},
     ports::ExchangeClient,
 };
@@ -230,6 +230,39 @@ impl PolymarketHttpExchange {
             });
         }
         Ok(out)
+    }
+
+    pub async fn submit_prepared_order(&self, prepared: &PreparedOrder) -> Result<OrderAck> {
+        let (tif, order_type) = Self::map_order_type(prepared.order_type);
+        let body = json!({
+            "order": prepared.signed.order.clone(),
+            "owner": self.creds.api_key.clone(),
+            "orderType": order_type,
+            "tif": tif,
+        });
+        let headers = create_l2_headers(&self.signer, &self.creds, "POST", "/order", Some(&body))?;
+        let resp = self.pool.post("/order", Some(headers), Some(&body)).await?;
+        let mut ack = OrderAck {
+            success: false,
+            error_message: None,
+            order_id: Some(prepared.signed.order_id.clone()),
+        };
+        if let Some(js) = resp.json {
+            ack.success = js.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+            if let Some(err) = js
+                .get("error")
+                .or_else(|| js.get("errorMsg"))
+                .and_then(|v| v.as_str())
+            {
+                ack.error_message = Some(err.to_string());
+            }
+            if let Some(order_id) = js.get("orderID").and_then(|v| v.as_str()) {
+                ack.order_id = Some(order_id.to_string());
+            }
+        } else if let Some(text) = resp.text {
+            ack.error_message = Some(text);
+        }
+        Ok(ack)
     }
 }
 

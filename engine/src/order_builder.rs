@@ -1,5 +1,5 @@
 use crate::eip712_sign::{calculate_order_id, sign_order, Eip712Order};
-use crate::model::Side;
+use crate::model::{OrderArgs, OrderType, Side};
 use crate::order_types::{CreateOrderOptionsRs, SigType, SignedOrderRequest, SignedOrderWithId};
 use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
@@ -173,6 +173,48 @@ pub fn build_signed_order(
     Ok(SignedOrderWithId {
         order: req,
         order_id,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedOrder {
+    pub signed: SignedOrderWithId,
+    pub args: OrderArgs,
+    pub order_type: OrderType,
+}
+
+pub fn prepare_signed_order(
+    signer: &PrivateKeySigner,
+    chain_id: u64,
+    args: OrderArgs,
+    order_type: OrderType,
+    opts: CreateOrderOptionsRs,
+    expiration: u64,
+    fee_rate_bps: u32,
+    nonce: U256,
+    taker: &str,
+    maker_override: Option<&str>,
+    sig_type: SigType,
+) -> Result<PreparedOrder> {
+    let signed = build_signed_order(
+        signer,
+        chain_id,
+        &args.token_id,
+        args.side,
+        args.price,
+        args.size,
+        opts,
+        expiration,
+        fee_rate_bps,
+        nonce,
+        taker,
+        maker_override,
+        sig_type,
+    )?;
+    Ok(PreparedOrder {
+        signed,
+        args,
+        order_type,
     })
 }
 

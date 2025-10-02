@@ -19,3 +19,4 @@ alloy-signer-local = { version = "0.7", features = ["eip712"] }
 async-trait = "0.1"
 futures = { workspace = true }
 tracing-subscriber = { workspace = true }
+alloy-primitives = "0.8.12"
