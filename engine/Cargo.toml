@@ -1,0 +1,40 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "engine"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_repr = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tungstenite = { workspace = true }
+tracing = { workspace = true }
+prometheus = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+async-trait = "0.1"
+num_cpus = "1"
+flate2 = { workspace = true }
+bytes = { workspace = true }
+alloy-signer-local = { version = "0.7", features = ["eip712"] }
+alloy-primitives = "0.8.12"
+alloy-sol-types = { version = "0.8.12", features = ["eip712-serde","json"] }
+alloy-signer = { version = "0.7", features = ["eip712"] }
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+rand = "0.8"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
