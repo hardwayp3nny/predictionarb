@@ -10,7 +10,7 @@ use engine::{
     http_pool::HttpPool,
     model::{
         BookSnapshot, CancelAck, DepthUpdate, Level, OpenOrder, OrderAck, OrderArgs, OrderBook,
-        OrderType, OrderUpdate, Side, UserEvent, UserTrade,
+        OrderStatus, OrderType, OrderUpdate, Side, UserEvent, UserTrade,
     },
     oms::OrderManager,
     order_builder::{prepare_signed_order, PreparedOrder},
@@ -18,7 +18,7 @@ use engine::{
     ports::{ExchangeClient, OrdersSnapshot, PositionsSnapshot},
     strategy::Strategy,
 };
-use futures::future::try_join_all;
+use futures::future::{join_all, try_join_all};
 use prometheus::Registry;
 use serde::Deserialize;
 use std::{
@@ -30,13 +30,30 @@ use std::{
     time::Duration,
 };
 use tokio::{fs, sync::RwLock};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 const EPSILON: f64 = 1e-9;
 const BOOKS_BATCH_LIMIT: usize = 200;
+const MIN_ASK_SIZE: f64 = 10.0;
+const MIN_BID_SIZE: f64 = 5.0;
+const MAX_ORDER_SIZE: f64 = 200.0;
+const POST_BATCH_SIZE: usize = 15;
+const ORDER_LOOP_INTERVAL_SECS: u64 = 5;
 
 fn floats_equal(a: f64, b: f64) -> bool {
     (a - b).abs() < EPSILON
+}
+
+fn floor_to_tick(value: f64, tick: f64) -> f64 {
+    if tick <= 0.0 {
+        return value;
+    }
+    let scaled = (value / tick).floor();
+    (scaled * tick).max(0.0)
+}
+
+fn order_is_active(order: &OpenOrder) -> bool {
+    matches!(order.status, OrderStatus::PendingNew | OrderStatus::Live)
 }
 
 fn sort_levels(levels: &mut Vec<Level>, is_bid: bool) {
@@ -383,15 +400,15 @@ impl ArbitrageStrategy {
         let mut combos: HashMap<String, Vec<ArbitrageToken>> = HashMap::new();
         let mut books: HashMap<String, Arc<RwLock<Option<OrderBook>>>> = HashMap::new();
         for token in tokens.iter_mut() {
-            combos
-                .entry(token.neg_risk_id.clone())
-                .or_default()
-                .push(token.clone());
             let book_snapshot = initial_books
                 .get(&token.token_id)
                 .map(|snap| snap.order_book.clone());
             let lock = Arc::new(RwLock::new(book_snapshot));
             token.order_book = lock.clone();
+            combos
+                .entry(token.neg_risk_id.clone())
+                .or_default()
+                .push(token.clone());
             books.insert(token.token_id.clone(), lock);
         }
 
@@ -429,6 +446,12 @@ impl ArbitrageStrategy {
         tokio::spawn(async move {
             sync_strategy
                 .sync_orders_positions_loop(Duration::from_secs(5))
+                .await;
+        });
+        let trading_strategy = self.clone();
+        tokio::spawn(async move {
+            trading_strategy
+                .trading_loop(Duration::from_secs(ORDER_LOOP_INTERVAL_SECS))
                 .await;
         });
         Ok(asset_ids)
@@ -526,6 +549,241 @@ impl ArbitrageStrategy {
     async fn get_order_manager(&self, token_id: &str) -> Option<OrderManager> {
         let guard = self.runtime.read().await;
         guard.as_ref().and_then(|rt| rt.get_order_manager(token_id))
+    }
+
+    async fn run_trading_cycle(&self) -> Result<()> {
+        let combos = {
+            let guard = self.runtime.read().await;
+            match guard.as_ref() {
+                Some(rt) => rt.combos.clone(),
+                None => return Ok(()),
+            }
+        };
+
+        let group_count = combos.len();
+        info!(groups = group_count, "starting trading cycle");
+        if combos.is_empty() {
+            return Ok(());
+        }
+
+        #[derive(Clone)]
+        struct GroupTokenInfo {
+            token: ArbitrageToken,
+            order_book: OrderBook,
+            best_ask: Level,
+        }
+
+        let mut prepared_orders: Vec<(String, String)> = Vec::new();
+
+        for (group_id, tokens) in combos {
+            let mut infos: Vec<GroupTokenInfo> = Vec::new();
+            for token in tokens {
+                let maybe_book = { token.order_book.read().await.clone() };
+                let book = match maybe_book {
+                    Some(book) => book,
+                    None => {
+                        info!(
+                            token_id = token.token_id.as_str(),
+                            symbol = token.symbol.as_str(),
+                            "no order book available"
+                        );
+                        continue;
+                    }
+                };
+                let mut filtered_asks: Vec<Level> = book
+                    .asks
+                    .iter()
+                    .filter(|lvl| lvl.size >= MIN_ASK_SIZE)
+                    .cloned()
+                    .collect();
+                if filtered_asks.is_empty() {
+                    info!(
+                        token_id = token.token_id.as_str(),
+                        symbol = token.symbol.as_str(),
+                        "no qualifying asks after filtering"
+                    );
+                    continue;
+                }
+                filtered_asks
+                    .sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(Ordering::Equal));
+                let best_ask = filtered_asks[0].clone();
+                infos.push(GroupTokenInfo {
+                    token,
+                    order_book: book,
+                    best_ask,
+                });
+            }
+
+            info!(
+                group_id = group_id.as_str(),
+                candidates = infos.len(),
+                "processing token group"
+            );
+            if infos.len() < 2 {
+                info!(
+                    group_id = group_id.as_str(),
+                    "not enough active tokens, skipping group"
+                );
+                continue;
+            }
+
+            let group_size = infos.len() as f64;
+
+            for idx in 0..infos.len() {
+                let token = infos[idx].token.clone();
+                let order_book = infos[idx].order_book.clone();
+                let other_best_asks: Vec<Level> = infos
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != idx)
+                    .map(|(_, ctx)| ctx.best_ask.clone())
+                    .collect();
+                if other_best_asks.is_empty() {
+                    continue;
+                }
+
+                let sum_i: f64 = other_best_asks.iter().map(|lvl| lvl.price).sum();
+                let minshares = other_best_asks
+                    .iter()
+                    .fold(f64::INFINITY, |acc, lvl| acc.min(lvl.size));
+                if !minshares.is_finite() || minshares <= 0.0 {
+                    continue;
+                }
+
+                let threshold_raw = group_size - sum_i - 1.0;
+                let threshold = floor_to_tick(threshold_raw, token.tick_size);
+                if threshold <= 0.0 {
+                    continue;
+                }
+
+                let mut relevant_bids: Vec<Level> = order_book
+                    .bids
+                    .iter()
+                    .filter(|lvl| lvl.price <= threshold + EPSILON)
+                    .filter(|lvl| lvl.size >= MIN_BID_SIZE)
+                    .cloned()
+                    .collect();
+                relevant_bids
+                    .sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(Ordering::Equal));
+
+                let mut target_price = threshold;
+                if let Some(highest) = relevant_bids.first() {
+                    if floats_equal(highest.price, threshold) {
+                        if relevant_bids.len() > 1 {
+                            target_price = relevant_bids[1].price + token.tick_size;
+                        } else {
+                            target_price = threshold;
+                        }
+                    } else {
+                        target_price = highest.price + token.tick_size;
+                    }
+                }
+
+                if target_price > threshold {
+                    target_price = threshold;
+                }
+                target_price = floor_to_tick(target_price, token.tick_size);
+                if target_price <= 0.0 {
+                    continue;
+                }
+
+                let order_size = minshares.min(MAX_ORDER_SIZE).floor();
+                if let Some(min_size) = token.min_order_size {
+                    if order_size < min_size {
+                        continue;
+                    }
+                }
+                if order_size <= 0.0 {
+                    continue;
+                }
+
+                let existing_orders = self.list_orders(&token.token_id).await;
+                if existing_orders.iter().any(order_is_active) {
+                    info!(
+                        token_id = token.token_id.as_str(),
+                        "skipping token due to active order"
+                    );
+                    continue;
+                }
+
+                info!(
+                    token_id = token.token_id.as_str(),
+                    symbol = token.symbol.as_str(),
+                    threshold,
+                    target_price,
+                    order_size,
+                    "preparing buy order"
+                );
+                match self
+                    .build_limit_order(
+                        &token.token_id,
+                        Side::Buy,
+                        target_price,
+                        order_size,
+                        OrderType::Gtc,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(order_id) => {
+                        prepared_orders.push((order_id, token.token_id.clone()));
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            token_id = token.token_id.as_str(),
+                            symbol = token.symbol.as_str(),
+                            "failed to build order"
+                        );
+                    }
+                }
+            }
+        }
+
+        if prepared_orders.is_empty() {
+            return Ok(());
+        }
+
+        for chunk in prepared_orders.chunks(POST_BATCH_SIZE) {
+            info!(batch_size = chunk.len(), "submitting order batch");
+            let results =
+                join_all(chunk.iter().map(|(order_id, _)| self.post_order(order_id))).await;
+            for ((order_id, token_id), result) in chunk.iter().zip(results.into_iter()) {
+                match result {
+                    Ok(ack) => {
+                        if !ack.success {
+                            warn!(
+                                token_id = token_id.as_str(),
+                                order_id = order_id.as_str(),
+                                error = ?ack.error_message,
+                                "order post failed"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            token_id = token_id.as_str(),
+                            order_id = order_id.as_str(),
+                            "failed to post order"
+                        );
+                    }
+                }
+            }
+            info!(batch_size = chunk.len(), "completed order batch submission");
+        }
+
+        Ok(())
+    }
+
+    async fn trading_loop(self, interval: Duration) {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            if let Err(err) = self.run_trading_cycle().await {
+                warn!(?err, "trading cycle failed");
+            }
+        }
     }
 
     pub async fn build_limit_order(
