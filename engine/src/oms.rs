@@ -15,6 +15,13 @@ pub struct OrderManager {
 }
 
 impl OrderManager {
+    fn status_is_terminal(status: &OrderStatus) -> bool {
+        matches!(
+            status,
+            OrderStatus::Matched | OrderStatus::Rejected | OrderStatus::Cancelled
+        )
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -36,12 +43,16 @@ impl OrderManager {
 
     pub fn on_ack(&self, ack: &OrderAck) {
         if let Some(id) = ack.order_id.as_ref() {
+            let mut remove_entry = false;
             if let Some(mut o) = self.orders.get_mut(id) {
                 o.status = if ack.success {
                     OrderStatus::Live
                 } else {
                     OrderStatus::Rejected
                 };
+                if !ack.success {
+                    remove_entry = true;
+                }
             }
             let mut s = self.stats.write();
             if ack.success {
@@ -49,12 +60,17 @@ impl OrderManager {
             } else {
                 s.orders_failed += 1;
             }
+            drop(s);
+            if remove_entry {
+                self.orders.remove(id);
+            }
         }
     }
 
     pub fn on_user_event(&self, ev: &UserEvent) {
         match ev {
             UserEvent::Order(upd) => {
+                let mut remove_entry = false;
                 if let Some(mut o) = self.orders.get_mut(&upd.id) {
                     o.size_matched = upd.size_matched;
                     let st = upd.status.to_uppercase();
@@ -70,6 +86,12 @@ impl OrderManager {
                     if o.size_matched >= o.size {
                         o.status = OrderStatus::Matched;
                     }
+                    if Self::status_is_terminal(&o.status) {
+                        remove_entry = true;
+                    }
+                }
+                if remove_entry {
+                    self.orders.remove(&upd.id);
                 }
             }
             UserEvent::Trade(_) => {}
@@ -99,6 +121,20 @@ impl OrderManager {
             }
         }
         v
+    }
+
+    pub fn remove(&self, id: &str) -> Option<OpenOrder> {
+        self.orders.remove(id).map(|(_, order)| order)
+    }
+
+    pub fn replace_id(&self, old_id: &str, new_id: &str) {
+        if old_id == new_id {
+            return;
+        }
+        if let Some((_, mut order)) = self.orders.remove(old_id) {
+            order.id = new_id.to_string();
+            self.orders.insert(new_id.to_string(), order);
+        }
     }
 }
 

@@ -29,7 +29,11 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{fs, sync::RwLock};
+use tokio::{
+    fs,
+    sync::RwLock,
+    time::{sleep, Instant},
+};
 use tracing::{error, info, warn};
 
 const EPSILON: f64 = 1e-9;
@@ -39,6 +43,9 @@ const MIN_BID_SIZE: f64 = 5.0;
 const MAX_ORDER_SIZE: f64 = 200.0;
 const POST_BATCH_SIZE: usize = 15;
 const ORDER_LOOP_INTERVAL_SECS: u64 = 5;
+const ORDER_HEALTH_INTERVAL_MS: u64 = 500;
+const HEDGE_TIMEOUT_SECS: u64 = 3;
+const GROUP_BLOCK_SECS: u64 = 60;
 
 fn floats_equal(a: f64, b: f64) -> bool {
     (a - b).abs() < EPSILON
@@ -49,6 +56,14 @@ fn floor_to_tick(value: f64, tick: f64) -> f64 {
         return value;
     }
     let scaled = (value / tick).floor();
+    (scaled * tick).max(0.0)
+}
+
+fn ceil_to_tick(value: f64, tick: f64) -> f64 {
+    if tick <= 0.0 {
+        return value;
+    }
+    let scaled = (value / tick).ceil();
     (scaled * tick).max(0.0)
 }
 
@@ -75,6 +90,62 @@ fn update_levels(levels: &mut Vec<Level>, price: f64, size: f64, is_bid: bool) {
         levels.push(Level { price, size });
     }
     sort_levels(levels, is_bid);
+}
+
+fn has_active_ask(book: &OrderBook) -> bool {
+    book.asks.iter().any(|lvl| lvl.size > EPSILON)
+}
+
+fn vwap_for_market_buy(book: &OrderBook, target_size: f64) -> Option<f64> {
+    if target_size <= EPSILON {
+        return None;
+    }
+    let mut remaining = target_size;
+    let mut notional = 0.0;
+    for level in &book.asks {
+        if level.size <= EPSILON {
+            continue;
+        }
+        let traded = remaining.min(level.size);
+        notional += traded * level.price;
+        remaining -= traded;
+        if remaining <= EPSILON {
+            break;
+        }
+    }
+    if remaining > EPSILON {
+        None
+    } else {
+        Some(notional / target_size)
+    }
+}
+
+fn price_for_instant_buy(book: &OrderBook, target_size: f64) -> Option<(f64, f64)> {
+    if target_size <= EPSILON {
+        return None;
+    }
+    let mut remaining = target_size;
+    let mut worst_price = 0.0;
+    let mut notional = 0.0;
+    for level in &book.asks {
+        if level.size <= EPSILON {
+            continue;
+        }
+        let traded = remaining.min(level.size);
+        notional += traded * level.price;
+        if level.price > worst_price {
+            worst_price = level.price;
+        }
+        remaining -= traded;
+        if remaining <= EPSILON {
+            break;
+        }
+    }
+    if remaining > EPSILON {
+        None
+    } else {
+        Some((worst_price, notional))
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -132,6 +203,48 @@ impl OrderBookAggregator {
     fn current(&self, asset_id: &str) -> Option<&OrderBook> {
         self.books.get(asset_id)
     }
+}
+
+#[derive(Debug, Clone)]
+struct HedgePendingOrder {
+    expected_fill: f64,
+    filled: f64,
+    deadline: Instant,
+}
+
+impl HedgePendingOrder {
+    fn new(expected_fill: f64, deadline: Instant) -> Self {
+        Self {
+            expected_fill,
+            filled: 0.0,
+            deadline,
+        }
+    }
+
+    fn remaining(&self) -> f64 {
+        (self.expected_fill - self.filled).max(0.0)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct GroupExecutionState {
+    blocked_until: Option<Instant>,
+    pending: HashMap<String, HedgePendingOrder>,
+}
+
+impl GroupExecutionState {
+    fn is_blocked(&self, now: Instant) -> bool {
+        self.blocked_until
+            .map(|deadline| deadline > now)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HedgeOrderPlan {
+    token: ArbitrageToken,
+    price: f64,
+    size: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +382,10 @@ pub struct ArbitrageStrategy {
     runtime: Arc<RwLock<Option<StrategyRuntime>>>,
     preloaded_api_creds: Arc<RwLock<Option<ApiCreds>>>,
     pending_orders: Arc<RwLock<HashMap<String, PreparedOrder>>>,
+    order_fill_tracker: Arc<RwLock<HashMap<String, f64>>>,
+    hedge_orders: Arc<RwLock<HashSet<String>>>,
+    hedge_order_index: Arc<RwLock<HashMap<String, String>>>,
+    group_states: Arc<RwLock<HashMap<String, GroupExecutionState>>>,
 }
 
 impl ArbitrageStrategy {
@@ -278,6 +395,10 @@ impl ArbitrageStrategy {
             runtime: Arc::new(RwLock::new(None)),
             preloaded_api_creds: Arc::new(RwLock::new(None)),
             pending_orders: Arc::new(RwLock::new(HashMap::new())),
+            order_fill_tracker: Arc::new(RwLock::new(HashMap::new())),
+            hedge_orders: Arc::new(RwLock::new(HashSet::new())),
+            hedge_order_index: Arc::new(RwLock::new(HashMap::new())),
+            group_states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -412,6 +533,16 @@ impl ArbitrageStrategy {
             books.insert(token.token_id.clone(), lock);
         }
 
+        {
+            let mut states = self.group_states.write().await;
+            states.retain(|group_id, _| combos.contains_key(group_id));
+            for group_id in combos.keys() {
+                states
+                    .entry(group_id.clone())
+                    .or_insert_with(GroupExecutionState::default);
+            }
+        }
+
         let mut seen = HashSet::new();
         let mut asset_ids = Vec::new();
         for token in &tokens {
@@ -452,6 +583,12 @@ impl ArbitrageStrategy {
         tokio::spawn(async move {
             trading_strategy
                 .trading_loop(Duration::from_secs(ORDER_LOOP_INTERVAL_SECS))
+                .await;
+        });
+        let health_strategy = self.clone();
+        tokio::spawn(async move {
+            health_strategy
+                .order_health_loop(Duration::from_millis(ORDER_HEALTH_INTERVAL_MS))
                 .await;
         });
         Ok(asset_ids)
@@ -566,6 +703,8 @@ impl ArbitrageStrategy {
             return Ok(());
         }
 
+        let blocked_groups = self.blocked_groups_snapshot().await;
+
         #[derive(Clone)]
         struct GroupTokenInfo {
             token: ArbitrageToken,
@@ -576,6 +715,13 @@ impl ArbitrageStrategy {
         let mut prepared_orders: Vec<(String, String)> = Vec::new();
 
         for (group_id, tokens) in combos {
+            if blocked_groups.contains(&group_id) {
+                info!(
+                    group_id = group_id.as_str(),
+                    "group blocked, skipping trading cycle entry"
+                );
+                continue;
+            }
             let mut infos: Vec<GroupTokenInfo> = Vec::new();
             for token in tokens {
                 let maybe_book = { token.order_book.read().await.clone() };
@@ -786,6 +932,16 @@ impl ArbitrageStrategy {
         }
     }
 
+    async fn order_health_loop(self, interval: Duration) {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            ticker.tick().await;
+            if let Err(err) = self.check_limit_orders_health().await {
+                warn!(?err, "order health check failed");
+            }
+        }
+    }
+
     pub async fn build_limit_order(
         &self,
         token_identifier: &str,
@@ -855,16 +1011,25 @@ impl ArbitrageStrategy {
         };
 
         manager.upsert_pending(prepared.signed.order_id.clone(), &prepared.args);
-        let ack = exchange.submit_prepared_order(&prepared).await?;
+        let submit_result = exchange.submit_prepared_order(&prepared).await;
+        let ack = match submit_result {
+            Ok(ack) => ack,
+            Err(err) => {
+                let mut guard = self.pending_orders.write().await;
+                guard.remove(order_id);
+                return Err(err);
+            }
+        };
+
         manager.on_ack(&ack);
 
-        if ack.success {
-            let ack_id = ack.order_id.clone();
+        {
+            // Always drop the prepared order after we attempt to submit it to avoid unbounded growth.
             let mut guard = self.pending_orders.write().await;
             guard.remove(order_id);
-            if let Some(actual) = ack_id {
+            if let Some(actual) = ack.order_id.as_ref() {
                 if actual != order_id {
-                    guard.remove(&actual);
+                    guard.remove(actual);
                 }
             }
         }
@@ -902,6 +1067,599 @@ impl ArbitrageStrategy {
         } else {
             Vec::new()
         }
+    }
+
+    async fn record_fill_delta(&self, order_id: &str, new_matched: f64) -> f64 {
+        let mut guard = self.order_fill_tracker.write().await;
+        let prev = guard.get(order_id).cloned().unwrap_or(0.0);
+        if new_matched + EPSILON < prev {
+            // Inconsistent update; reset baseline to avoid negative delta.
+            guard.insert(order_id.to_string(), new_matched);
+            0.0
+        } else {
+            guard.insert(order_id.to_string(), new_matched);
+            new_matched - prev
+        }
+    }
+
+    async fn blocked_groups_snapshot(&self) -> HashSet<String> {
+        let now = Instant::now();
+        let guard = self.group_states.read().await;
+        guard
+            .iter()
+            .filter_map(|(group_id, state)| {
+                if state.is_blocked(now) {
+                    Some(group_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    async fn is_group_blocked(&self, group_id: &str) -> bool {
+        let now = Instant::now();
+        let guard = self.group_states.read().await;
+        guard
+            .get(group_id)
+            .map(|state| state.is_blocked(now))
+            .unwrap_or(false)
+    }
+
+    async fn handle_group_timeout(&self, group_id: &str) -> Result<()> {
+        let now = Instant::now();
+        let pending_orders: Vec<String> = {
+            let mut guard = self.group_states.write().await;
+            if let Some(state) = guard.get_mut(group_id) {
+                let keys: Vec<String> = state.pending.keys().cloned().collect();
+                state.pending.clear();
+                state.blocked_until = Some(now + Duration::from_secs(GROUP_BLOCK_SECS));
+                keys
+            } else {
+                Vec::new()
+            }
+        };
+
+        if !pending_orders.is_empty() {
+            let mut hedge_guard = self.hedge_orders.write().await;
+            for order_id in &pending_orders {
+                hedge_guard.remove(order_id);
+            }
+            drop(hedge_guard);
+
+            let mut index_guard = self.hedge_order_index.write().await;
+            for order_id in &pending_orders {
+                index_guard.remove(order_id);
+            }
+        }
+
+        {
+            let mut tracker = self.order_fill_tracker.write().await;
+            for order_id in &pending_orders {
+                tracker.remove(order_id);
+            }
+        }
+
+        let cancel_ids = self.collect_group_order_ids(group_id).await?;
+        if !cancel_ids.is_empty() {
+            match self.cancel_orders(cancel_ids.clone()).await {
+                Ok(_) => info!(
+                    group_id = group_id,
+                    order_ids = ?cancel_ids,
+                    "cancelled group orders after hedge timeout"
+                ),
+                Err(err) => warn!(
+                    ?err,
+                    group_id = group_id,
+                    order_ids = ?cancel_ids,
+                    "failed to cancel group orders after hedge timeout"
+                ),
+            }
+        }
+
+        info!(group_id = group_id, "group blocked due to hedge timeout");
+        Ok(())
+    }
+
+    async fn maybe_timeout_group(&self, group_id: &str) -> Result<()> {
+        let now = Instant::now();
+        let expired = {
+            let guard = self.group_states.read().await;
+            guard.get(group_id).map_or(false, |state| {
+                state
+                    .pending
+                    .values()
+                    .any(|pending| pending.deadline <= now && pending.remaining() > EPSILON)
+            })
+        };
+
+        if expired {
+            self.handle_group_timeout(group_id).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn collect_group_order_ids(&self, group_id: &str) -> Result<Vec<String>> {
+        let token_ids = {
+            let guard = self.runtime.read().await;
+            let Some(rt) = guard.as_ref() else {
+                return Ok(Vec::new());
+            };
+            let Some(tokens) = rt.combos.get(group_id) else {
+                return Ok(Vec::new());
+            };
+            tokens
+                .iter()
+                .map(|token| token.token_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut ids: Vec<String> = Vec::new();
+        for token_id in token_ids {
+            let orders = self.list_orders(&token_id).await;
+            for order in orders.into_iter() {
+                if order_is_active(&order) {
+                    ids.push(order.id.clone());
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    async fn is_hedge_order(&self, order_id: &str) -> bool {
+        let guard = self.hedge_orders.read().await;
+        guard.contains(order_id)
+    }
+
+    async fn remove_hedge_tracking(&self, order_id: &str) {
+        {
+            let mut guard = self.hedge_orders.write().await;
+            guard.remove(order_id);
+        }
+        let group_id = {
+            let mut guard = self.hedge_order_index.write().await;
+            guard.remove(order_id)
+        };
+        if let Some(group_id) = group_id {
+            let mut state_guard = self.group_states.write().await;
+            if let Some(state) = state_guard.get_mut(&group_id) {
+                state.pending.remove(order_id);
+            }
+        }
+    }
+
+    async fn register_hedge_order(&self, group_id: &str, order_id: &str, expected_fill: f64) {
+        {
+            let mut guard = self.hedge_orders.write().await;
+            guard.insert(order_id.to_string());
+        }
+        {
+            let mut guard = self.hedge_order_index.write().await;
+            guard.insert(order_id.to_string(), group_id.to_string());
+        }
+        {
+            let mut guard = self.group_states.write().await;
+            let state = guard
+                .entry(group_id.to_string())
+                .or_insert_with(GroupExecutionState::default);
+            state.pending.insert(
+                order_id.to_string(),
+                HedgePendingOrder::new(
+                    expected_fill,
+                    Instant::now() + Duration::from_secs(HEDGE_TIMEOUT_SECS),
+                ),
+            );
+        }
+
+        let strategy = self.clone();
+        let group_key = group_id.to_string();
+        let order_key = order_id.to_string();
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(HEDGE_TIMEOUT_SECS)).await;
+            if let Err(err) = strategy.maybe_timeout_group(&group_key).await {
+                warn!(
+                    ?err,
+                    group_id = group_key.as_str(),
+                    order_id = order_key.as_str(),
+                    "hedge timeout task failed"
+                );
+            }
+        });
+    }
+
+    async fn handle_order_fill(&self, event: OrderUpdate, delta: f64) -> Result<()> {
+        if self.is_hedge_order(&event.id).await {
+            self.update_hedge_progress(&event, delta).await
+        } else {
+            self.handle_primary_order_fill(&event, delta).await
+        }
+    }
+
+    async fn update_hedge_progress(&self, event: &OrderUpdate, delta: f64) -> Result<()> {
+        let group_id = {
+            let guard = self.hedge_order_index.read().await;
+            guard.get(&event.id).cloned()
+        };
+
+        let Some(group_id) = group_id else {
+            return Ok(());
+        };
+
+        let status = event.status.to_uppercase();
+        let mut should_remove = false;
+        let mut should_fail = false;
+
+        {
+            let mut guard = self.group_states.write().await;
+            if let Some(state) = guard.get_mut(&group_id) {
+                if let Some(pending) = state.pending.get_mut(&event.id) {
+                    pending.filled += delta;
+                    let remaining = pending.remaining();
+                    if remaining <= EPSILON || status == "MATCHED" {
+                        state.pending.remove(&event.id);
+                        should_remove = true;
+                    } else if matches!(status.as_str(), "CANCELLED" | "CANCELED" | "REJECTED") {
+                        state.pending.remove(&event.id);
+                        should_remove = true;
+                        should_fail = true;
+                    }
+                } else {
+                    should_remove = true;
+                }
+            } else {
+                should_remove = true;
+            }
+        }
+
+        if should_remove {
+            self.remove_hedge_tracking(&event.id).await;
+        }
+
+        if should_fail {
+            self.handle_group_timeout(&group_id).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_primary_order_fill(&self, event: &OrderUpdate, delta: f64) -> Result<()> {
+        if delta <= EPSILON {
+            return Ok(());
+        }
+
+        if event.side != Side::Buy {
+            return Ok(());
+        }
+
+        let (trigger_token, group_tokens) = {
+            let guard = self.runtime.read().await;
+            let Some(rt) = guard.as_ref() else {
+                return Ok(());
+            };
+            let Some(token) = rt
+                .tokens
+                .iter()
+                .find(|token| token.token_id == event.asset_id)
+                .cloned()
+            else {
+                return Ok(());
+            };
+            let Some(group) = rt.combos.get(&token.neg_risk_id).cloned() else {
+                return Ok(());
+            };
+            (token, group)
+        };
+
+        if group_tokens.len() <= 1 {
+            return Ok(());
+        }
+
+        if self.is_group_blocked(&trigger_token.neg_risk_id).await {
+            info!(
+                group_id = trigger_token.neg_risk_id.as_str(),
+                "group blocked, skipping hedge placement"
+            );
+            return Ok(());
+        }
+
+        self.initiate_group_hedge(trigger_token, group_tokens, delta)
+            .await
+    }
+
+    async fn initiate_group_hedge(
+        &self,
+        trigger_token: ArbitrageToken,
+        group_tokens: Vec<ArbitrageToken>,
+        delta: f64,
+    ) -> Result<()> {
+        if delta <= EPSILON {
+            return Ok(());
+        }
+
+        let mut plans: Vec<HedgeOrderPlan> = Vec::new();
+
+        for token in group_tokens.into_iter() {
+            if token.token_id == trigger_token.token_id {
+                continue;
+            }
+
+            let Some(book) = self.order_book_snapshot(&token.token_id).await else {
+                continue;
+            };
+
+            if !has_active_ask(&book) {
+                continue;
+            }
+
+            if let Some(min_size) = token.min_order_size {
+                if delta + EPSILON < min_size {
+                    info!(
+                        token_id = token.token_id.as_str(),
+                        required = min_size,
+                        available = delta,
+                        "skipping hedge due to min order size"
+                    );
+                    return Ok(());
+                }
+            }
+
+            let Some((worst_price, _)) = price_for_instant_buy(&book, delta) else {
+                warn!(
+                    token_id = token.token_id.as_str(),
+                    size = delta,
+                    "insufficient ask liquidity for hedge"
+                );
+                return Ok(());
+            };
+
+            let mut limit_price = if token.tick_size > 0.0 {
+                ceil_to_tick(worst_price, token.tick_size)
+            } else {
+                worst_price
+            };
+
+            if limit_price <= 0.0 {
+                warn!(
+                    token_id = token.token_id.as_str(),
+                    "invalid hedge price computed"
+                );
+                return Ok(());
+            }
+
+            if limit_price * delta < 1.0 - EPSILON {
+                let required_price = if delta > EPSILON {
+                    1.0 / delta
+                } else {
+                    limit_price
+                };
+                let adjusted = if token.tick_size > 0.0 {
+                    ceil_to_tick(required_price, token.tick_size)
+                } else {
+                    required_price
+                };
+                limit_price = limit_price.max(adjusted);
+            }
+
+            if limit_price * delta < 1.0 - EPSILON {
+                warn!(
+                    token_id = token.token_id.as_str(),
+                    price = limit_price,
+                    size = delta,
+                    "unable to reach $1 notional for hedge"
+                );
+                return Ok(());
+            }
+
+            plans.push(HedgeOrderPlan {
+                token,
+                price: limit_price,
+                size: delta,
+            });
+        }
+
+        if plans.is_empty() {
+            return Ok(());
+        }
+
+        self.execute_hedge_orders(&trigger_token.neg_risk_id, plans)
+            .await
+    }
+
+    async fn execute_hedge_orders(&self, group_id: &str, plans: Vec<HedgeOrderPlan>) -> Result<()> {
+        let mut registered: Vec<(String, String, f64)> = Vec::new();
+
+        for plan in plans.iter() {
+            let order_id = match self
+                .build_limit_order(
+                    &plan.token.token_id,
+                    Side::Buy,
+                    plan.price,
+                    plan.size,
+                    OrderType::Gtc,
+                    None,
+                )
+                .await
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        token_id = plan.token.token_id.as_str(),
+                        "failed to build hedge order"
+                    );
+                    return Ok(());
+                }
+            };
+
+            match self.post_order(&order_id).await {
+                Ok(ack) => {
+                    if !ack.success {
+                        warn!(
+                            token_id = plan.token.token_id.as_str(),
+                            order_id = order_id.as_str(),
+                            error = ?ack.error_message,
+                            "hedge order rejected"
+                        );
+                        self.handle_group_timeout(group_id).await?;
+                        return Ok(());
+                    }
+                    let actual_id = ack.order_id.clone().unwrap_or(order_id.clone());
+                    registered.push((actual_id, plan.token.token_id.clone(), plan.size));
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        token_id = plan.token.token_id.as_str(),
+                        order_id = order_id.as_str(),
+                        "failed to post hedge order"
+                    );
+                    self.handle_group_timeout(group_id).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        if registered.is_empty() {
+            return Ok(());
+        }
+
+        for (order_id, _, expected) in &registered {
+            self.register_hedge_order(group_id, order_id, *expected)
+                .await;
+        }
+
+        info!(
+            group_id = group_id,
+            hedge_orders = registered.len(),
+            "submitted hedge orders"
+        );
+        Ok(())
+    }
+
+    async fn check_limit_orders_health(&self) -> Result<()> {
+        let (token_map, combos_index) = {
+            let guard = self.runtime.read().await;
+            let Some(rt) = guard.as_ref() else {
+                return Ok(());
+            };
+            let token_map: HashMap<String, ArbitrageToken> = rt
+                .tokens
+                .iter()
+                .cloned()
+                .map(|token| (token.token_id.clone(), token))
+                .collect();
+            let combos_index: HashMap<String, Vec<String>> = rt
+                .combos
+                .iter()
+                .map(|(neg_risk_id, tokens)| {
+                    (
+                        neg_risk_id.clone(),
+                        tokens
+                            .iter()
+                            .map(|token| token.token_id.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            (token_map, combos_index)
+        };
+
+        if token_map.is_empty() {
+            return Ok(());
+        }
+
+        let mut to_cancel: HashSet<String> = HashSet::new();
+
+        for (token_id, token) in token_map.iter() {
+            let orders = self.list_orders(token_id).await;
+            for order in orders.into_iter() {
+                if !order_is_active(&order) || order.side != Side::Buy {
+                    continue;
+                }
+
+                let remaining_size = (order.size - order.size_matched).max(0.0);
+                if remaining_size <= EPSILON {
+                    continue;
+                }
+
+                let combo_tokens = match combos_index.get(&token.neg_risk_id) {
+                    Some(ids) => ids,
+                    None => continue,
+                };
+
+                let mut active_count = 0usize;
+                let mut vwap_sum = 0.0;
+                let mut insufficient_liquidity = false;
+
+                for combo_token_id in combo_tokens.iter() {
+                    let Some(combo_token) = token_map.get(combo_token_id) else {
+                        continue;
+                    };
+                    let book_opt = {
+                        let guard = combo_token.order_book.read().await;
+                        guard.clone()
+                    };
+                    let Some(book) = book_opt else {
+                        continue;
+                    };
+                    if !has_active_ask(&book) {
+                        continue;
+                    }
+                    active_count += 1;
+                    if combo_token_id == &order.asset_id {
+                        continue;
+                    }
+                    match vwap_for_market_buy(&book, remaining_size) {
+                        Some(avg_price) => {
+                            vwap_sum += avg_price;
+                        }
+                        None => {
+                            insufficient_liquidity = true;
+                            break;
+                        }
+                    }
+                }
+
+                if active_count <= 1 {
+                    continue;
+                }
+
+                if insufficient_liquidity {
+                    to_cancel.insert(order.id.clone());
+                    continue;
+                }
+
+                let allowed = (active_count as f64 - 1.0) - (vwap_sum + order.price);
+                if allowed < -EPSILON {
+                    to_cancel.insert(order.id.clone());
+                }
+            }
+        }
+
+        if to_cancel.is_empty() {
+            return Ok(());
+        }
+
+        let mut ids: Vec<String> = to_cancel.into_iter().collect();
+        ids.sort();
+        let orders_cancelled = ids.clone();
+        match self.cancel_orders(ids).await {
+            Ok(_) => {
+                info!(order_ids = ?orders_cancelled, "cancelled unhealthy limit orders");
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    order_ids = ?orders_cancelled,
+                    "failed to cancel unhealthy limit orders"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     async fn sync_orders_once(&self) -> Result<()> {
@@ -966,6 +1724,19 @@ impl ArbitrageStrategy {
             let evt = UserEvent::Order(event.clone());
             manager.on_user_event(&evt);
         }
+
+        let delta = self.record_fill_delta(&event.id, event.size_matched).await;
+        if delta > EPSILON {
+            if let Err(err) = self.handle_order_fill(event.clone(), delta).await {
+                warn!(
+                    ?err,
+                    order_id = event.id.as_str(),
+                    asset_id = event.asset_id.as_str(),
+                    "failed to process order fill"
+                );
+            }
+        }
+
         let status = event.status.to_uppercase();
         if matches!(
             status.as_str(),
@@ -973,6 +1744,11 @@ impl ArbitrageStrategy {
         ) {
             let mut guard = self.pending_orders.write().await;
             guard.remove(&event.id);
+            {
+                let mut tracker = self.order_fill_tracker.write().await;
+                tracker.remove(&event.id);
+            }
+            self.remove_hedge_tracking(&event.id).await;
         }
     }
 
