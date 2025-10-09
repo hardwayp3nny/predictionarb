@@ -3,10 +3,10 @@ use engine::{auth::ApiCreds, config::EngineConfig, ws_user2::UserWsV2, UserStrea
 use std::{env, fs::OpenOptions};
 use tokio::time::{sleep, Duration};
 
-const DEFAULT_API_KEY: &str = "61eb97a2-94c7-c16b-6966-e795b6e882ac";
-const DEFAULT_API_SECRET: &str = "vsaaCY30PRxuqpCfVKHGCrWJOq0P5L7y1D010J22EC4=";
+const DEFAULT_API_KEY: &str = "";
+const DEFAULT_API_SECRET: &str = "";
 const DEFAULT_API_PASSPHRASE: &str =
-    "dc4d5c86c2808392e07d27b84042541dd57f86686e3d0fdc9adbe0989c6313b5";
+    "";
 
 #[tokio::main]
 async fn main() -> Result<()> {

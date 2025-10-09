@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_repr::{Deserialize_repr, Serialize_repr};
 use uuid::Uuid;
 
 pub type TimestampMs = i64;

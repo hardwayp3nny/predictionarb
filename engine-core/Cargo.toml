@@ -1,0 +1,16 @@
+[package]
+name = "engine-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "engine_core"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+async-trait = "0.1"
+prometheus = { workspace = true }
+num_cpus = "1"

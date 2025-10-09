@@ -14,7 +14,6 @@ tokio = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_repr = { workspace = true }
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tungstenite = { workspace = true }
@@ -42,3 +41,4 @@ rand = "0.8"
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
+engine-core = { path = "../engine-core" }
