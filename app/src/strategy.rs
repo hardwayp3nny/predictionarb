@@ -21,6 +21,7 @@ use engine::{
 use futures::future::{join_all, try_join_all};
 use prometheus::Registry;
 use serde::Deserialize;
+use serde_json::json;
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
@@ -31,7 +32,9 @@ use std::{
 };
 use tokio::{
     fs,
-    sync::RwLock,
+    fs::OpenOptions,
+    io::AsyncWriteExt,
+    sync::{Mutex, RwLock},
     time::{sleep, Instant},
 };
 use tracing::{error, info, warn};
@@ -145,6 +148,144 @@ fn price_for_instant_buy(book: &OrderBook, target_size: f64) -> Option<(f64, f64
         None
     } else {
         Some((worst_price, notional))
+    }
+}
+
+fn current_timestamp_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| dur.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+struct LoggerState {
+    file: Option<tokio::fs::File>,
+    size: u64,
+}
+
+#[derive(Clone)]
+struct PersistentLogger {
+    dir: PathBuf,
+    base_name: String,
+    max_files: usize,
+    max_bytes: u64,
+    state: Arc<Mutex<LoggerState>>,
+}
+
+impl PersistentLogger {
+    fn new(dir: PathBuf, base_name: String, max_files: usize, max_bytes: u64) -> Self {
+        let normalized_max_files = max_files.max(1);
+        Self {
+            dir,
+            base_name,
+            max_files: normalized_max_files,
+            max_bytes: max_bytes.max(1),
+            state: Arc::new(Mutex::new(LoggerState {
+                file: None,
+                size: 0,
+            })),
+        }
+    }
+
+    async fn log_json(&self, value: serde_json::Value) -> Result<()> {
+        let line = value.to_string();
+        self.write_line(line.as_bytes()).await
+    }
+
+    async fn write_line(&self, bytes: &[u8]) -> Result<()> {
+        fs::create_dir_all(&self.dir)
+            .await
+            .with_context(|| format!("create log dir: {}", self.dir.display()))?;
+
+        let needed = bytes.len() as u64 + 1; // account for newline
+
+        {
+            let mut guard = self.state.lock().await;
+            if guard.file.is_none() {
+                let (file, size) = self.open_current_file().await?;
+                guard.file = Some(file);
+                guard.size = size;
+            }
+
+            if guard.size + needed > self.max_bytes {
+                guard.file = None;
+                guard.size = 0;
+                drop(guard);
+                self.rotate_files().await?;
+                let mut guard = self.state.lock().await;
+                let (file, size) = self.open_current_file().await?;
+                guard.file = Some(file);
+                guard.size = size;
+                self.write_to_file(guard.file.as_mut().unwrap(), bytes)
+                    .await?;
+                guard.size += needed;
+                return Ok(());
+            } else {
+                self.write_to_file(guard.file.as_mut().unwrap(), bytes)
+                    .await?;
+                guard.size += needed;
+                return Ok(());
+            }
+        }
+    }
+
+    async fn write_to_file(&self, file: &mut tokio::fs::File, bytes: &[u8]) -> Result<()> {
+        file.write_all(bytes).await.context("write log line")?;
+        file.write_all(b"\n").await.context("write log newline")?;
+        file.flush().await.context("flush log file")?;
+        Ok(())
+    }
+
+    async fn open_current_file(&self) -> Result<(tokio::fs::File, u64)> {
+        let path = self.base_file_path();
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .with_context(|| format!("open log file: {}", path.display()))?;
+        let size = file.metadata().await.map(|meta| meta.len()).unwrap_or(0);
+        Ok((file, size))
+    }
+
+    async fn rotate_files(&self) -> Result<()> {
+        let archives = self.max_files.saturating_sub(1);
+        if archives == 0 {
+            let _ = fs::remove_file(self.base_file_path()).await;
+            return Ok(());
+        }
+
+        let oldest = self.rotated_path(archives);
+        let _ = fs::remove_file(&oldest).await;
+
+        for idx in (1..archives).rev() {
+            let src = self.rotated_path(idx);
+            let dst = self.rotated_path(idx + 1);
+            if fs::metadata(&src).await.is_ok() {
+                fs::rename(&src, &dst).await.with_context(|| {
+                    format!("rotate log file {} -> {}", src.display(), dst.display())
+                })?;
+            }
+        }
+
+        let base = self.base_file_path();
+        if fs::metadata(&base).await.is_ok() {
+            fs::rename(&base, self.rotated_path(1))
+                .await
+                .with_context(|| format!("rotate base log file: {}", base.display()))?;
+        }
+
+        Ok(())
+    }
+
+    fn base_file_path(&self) -> PathBuf {
+        self.dir.join(&self.base_name)
+    }
+
+    fn rotated_path(&self, index: usize) -> PathBuf {
+        self.dir.join(format!("{}.{}", self.base_name, index))
     }
 }
 
@@ -295,11 +436,20 @@ struct PoolConfig {
     max_connections: Option<usize>,
     #[serde(default)]
     connection_timeout: Option<u64>,
+    #[serde(default)]
+    health_path: Option<String>,
+    #[serde(default)]
+    health_interval_secs: Option<u64>,
 }
 
 impl PoolConfig {
     fn connection_timeout_ms(&self) -> Option<u64> {
         self.connection_timeout
+            .map(|seconds| seconds.saturating_mul(1_000))
+    }
+
+    fn health_interval_ms(&self) -> Option<u64> {
+        self.health_interval_secs
             .map(|seconds| seconds.saturating_mul(1_000))
     }
 }
@@ -386,10 +536,14 @@ pub struct ArbitrageStrategy {
     hedge_orders: Arc<RwLock<HashSet<String>>>,
     hedge_order_index: Arc<RwLock<HashMap<String, String>>>,
     group_states: Arc<RwLock<HashMap<String, GroupExecutionState>>>,
+    logger: Arc<PersistentLogger>,
 }
 
 impl ArbitrageStrategy {
     pub fn new<P: Into<PathBuf>>(config_path: P) -> Self {
+        let logs_dir = PathBuf::from("logs");
+        let logger =
+            PersistentLogger::new(logs_dir, "strategy.log".to_string(), 10, 10 * 1024 * 1024);
         Self {
             config_path: config_path.into(),
             runtime: Arc::new(RwLock::new(None)),
@@ -399,6 +553,7 @@ impl ArbitrageStrategy {
             hedge_orders: Arc::new(RwLock::new(HashSet::new())),
             hedge_order_index: Arc::new(RwLock::new(HashMap::new())),
             group_states: Arc::new(RwLock::new(HashMap::new())),
+            logger: Arc::new(logger),
         }
     }
 
@@ -425,6 +580,12 @@ impl ArbitrageStrategy {
             }
             if let Some(timeout_ms) = pool_cfg.connection_timeout_ms() {
                 engine_cfg.http.timeout_ms = timeout_ms;
+            }
+            if let Some(path) = pool_cfg.health_path.as_ref() {
+                engine_cfg.http.health_path = path.clone();
+            }
+            if let Some(interval_ms) = pool_cfg.health_interval_ms() {
+                engine_cfg.http.health_interval_ms = interval_ms;
             }
         }
 
@@ -892,8 +1053,12 @@ impl ArbitrageStrategy {
 
         for chunk in prepared_orders.chunks(POST_BATCH_SIZE) {
             info!(batch_size = chunk.len(), "submitting order batch");
-            let results =
-                join_all(chunk.iter().map(|(order_id, _)| self.post_order(order_id))).await;
+            let results = join_all(
+                chunk
+                    .iter()
+                    .map(|(order_id, _)| self.post_order(order_id, "primary")),
+            )
+            .await;
             for ((order_id, token_id), result) in chunk.iter().zip(results.into_iter()) {
                 match result {
                     Ok(ack) => {
@@ -992,7 +1157,7 @@ impl ArbitrageStrategy {
         Ok(order_id)
     }
 
-    pub async fn post_order(&self, order_id: &str) -> Result<OrderAck> {
+    pub async fn post_order(&self, order_id: &str, source: &str) -> Result<OrderAck> {
         let prepared = {
             let guard = self.pending_orders.read().await;
             guard
@@ -1011,6 +1176,10 @@ impl ArbitrageStrategy {
         };
 
         manager.upsert_pending(prepared.signed.order_id.clone(), &prepared.args);
+
+        self.log_order_submission_event(&prepared.args, &prepared.signed.order_id, source)
+            .await;
+
         let submit_result = exchange.submit_prepared_order(&prepared).await;
         let ack = match submit_result {
             Ok(ack) => ack,
@@ -1069,17 +1238,28 @@ impl ArbitrageStrategy {
         }
     }
 
-    async fn record_fill_delta(&self, order_id: &str, new_matched: f64) -> f64 {
+    async fn record_fill_delta(&self, order_id: &str, new_matched: f64) -> (f64, f64) {
         let mut guard = self.order_fill_tracker.write().await;
         let prev = guard.get(order_id).cloned().unwrap_or(0.0);
-        if new_matched + EPSILON < prev {
+        let delta = if new_matched + EPSILON < prev {
             // Inconsistent update; reset baseline to avoid negative delta.
             guard.insert(order_id.to_string(), new_matched);
             0.0
         } else {
+            let diff = new_matched - prev;
             guard.insert(order_id.to_string(), new_matched);
-            new_matched - prev
-        }
+            if diff <= EPSILON {
+                0.0
+            } else {
+                diff
+            }
+        };
+        (delta, prev)
+    }
+
+    async fn override_fill_total(&self, order_id: &str, total_matched: f64) {
+        let mut guard = self.order_fill_tracker.write().await;
+        guard.insert(order_id.to_string(), total_matched);
     }
 
     async fn blocked_groups_snapshot(&self) -> HashSet<String> {
@@ -1104,6 +1284,75 @@ impl ArbitrageStrategy {
             .get(group_id)
             .map(|state| state.is_blocked(now))
             .unwrap_or(false)
+    }
+
+    async fn token_symbol(&self, token_id: &str) -> Option<String> {
+        let guard = self.runtime.read().await;
+        guard.as_ref().and_then(|rt| {
+            rt.tokens
+                .iter()
+                .find(|token| token.token_id == token_id)
+                .map(|token| token.symbol.clone())
+        })
+    }
+
+    fn side_label(side: Side) -> &'static str {
+        match side {
+            Side::Buy => "BUY",
+            Side::Sell => "SELL",
+        }
+    }
+
+    async fn log_order_submission_event(&self, args: &OrderArgs, order_id: &str, source: &str) {
+        let symbol = self
+            .token_symbol(&args.token_id)
+            .await
+            .unwrap_or_else(|| args.token_id.clone());
+        let entry = json!({
+            "type": "order_submit",
+            "timestamp_ms": current_timestamp_ms(),
+            "order_id": order_id,
+            "token_id": args.token_id,
+            "symbol": symbol,
+            "side": Self::side_label(args.side),
+            "price": args.price,
+            "size": args.size,
+            "source": source,
+        });
+        if let Err(err) = self.logger.log_json(entry).await {
+            warn!(
+                ?err,
+                order_id = order_id,
+                token_id = args.token_id.as_str(),
+                "failed to write order submission log"
+            );
+        }
+    }
+
+    async fn log_order_update_event(&self, event: &OrderUpdate) {
+        let symbol = self
+            .token_symbol(&event.asset_id)
+            .await
+            .unwrap_or_else(|| event.asset_id.clone());
+        let entry = json!({
+            "type": "order_update",
+            "timestamp_ms": current_timestamp_ms(),
+            "order_id": event.id,
+            "token_id": event.asset_id,
+            "symbol": symbol,
+            "status": event.status,
+            "side": Self::side_label(event.side),
+            "price": event.price,
+            "size_matched": event.size_matched,
+        });
+        if let Err(err) = self.logger.log_json(entry).await {
+            warn!(
+                ?err,
+                order_id = event.id.as_str(),
+                token_id = event.asset_id.as_str(),
+                "failed to write order update log"
+            );
+        }
     }
 
     async fn handle_group_timeout(&self, group_id: &str) -> Result<()> {
@@ -1357,13 +1606,13 @@ impl ArbitrageStrategy {
             return Ok(());
         }
 
-        if self.is_group_blocked(&trigger_token.neg_risk_id).await {
-            info!(
-                group_id = trigger_token.neg_risk_id.as_str(),
-                "group blocked, skipping hedge placement"
-            );
-            return Ok(());
-        }
+        // if self.is_group_blocked(&trigger_token.neg_risk_id).await {
+        //     info!(
+        //         group_id = trigger_token.neg_risk_id.as_str(),
+        //         "group blocked, skipping hedge placement"
+        //     );
+        //     return Ok(());
+        // }
 
         self.initiate_group_hedge(trigger_token, group_tokens, delta)
             .await
@@ -1392,18 +1641,6 @@ impl ArbitrageStrategy {
 
             if !has_active_ask(&book) {
                 continue;
-            }
-
-            if let Some(min_size) = token.min_order_size {
-                if delta + EPSILON < min_size {
-                    info!(
-                        token_id = token.token_id.as_str(),
-                        required = min_size,
-                        available = delta,
-                        "skipping hedge due to min order size"
-                    );
-                    return Ok(());
-                }
             }
 
             let Some((worst_price, _)) = price_for_instant_buy(&book, delta) else {
@@ -1471,8 +1708,9 @@ impl ArbitrageStrategy {
     async fn execute_hedge_orders(&self, group_id: &str, plans: Vec<HedgeOrderPlan>) -> Result<()> {
         let mut registered: Vec<(String, String, f64)> = Vec::new();
 
+        let mut built_orders: Vec<(String, HedgeOrderPlan)> = Vec::new();
         for plan in plans.iter() {
-            let order_id = match self
+            match self
                 .build_limit_order(
                     &plan.token.token_id,
                     Side::Buy,
@@ -1483,7 +1721,7 @@ impl ArbitrageStrategy {
                 )
                 .await
             {
-                Ok(id) => id,
+                Ok(id) => built_orders.push((id, plan.clone())),
                 Err(err) => {
                     warn!(
                         ?err,
@@ -1492,9 +1730,22 @@ impl ArbitrageStrategy {
                     );
                     return Ok(());
                 }
-            };
+            }
+        }
 
-            match self.post_order(&order_id).await {
+        if built_orders.is_empty() {
+            return Ok(());
+        }
+
+        let results = join_all(
+            built_orders
+                .iter()
+                .map(|(order_id, _)| self.post_order(order_id, "hedge")),
+        )
+        .await;
+
+        for ((order_id, plan), result) in built_orders.into_iter().zip(results.into_iter()) {
+            match result {
                 Ok(ack) => {
                     if !ack.success {
                         warn!(
@@ -1720,12 +1971,34 @@ impl ArbitrageStrategy {
     }
 
     async fn handle_order_update(&self, event: OrderUpdate) {
-        if let Some(manager) = self.ensure_order_manager(&event.asset_id).await {
+        let manager = self.ensure_order_manager(&event.asset_id).await;
+        if let Some(ref mgr) = manager {
             let evt = UserEvent::Order(event.clone());
-            manager.on_user_event(&evt);
+            mgr.on_user_event(&evt);
         }
 
-        let delta = self.record_fill_delta(&event.id, event.size_matched).await;
+        self.log_order_update_event(&event).await;
+
+        let (mut delta, prev_total) = self.record_fill_delta(&event.id, event.size_matched).await;
+        let status = event.status.to_uppercase();
+
+        if delta <= EPSILON && status == "MATCHED" {
+            if let Some(ref mgr) = manager {
+                if let Some(order_size) = mgr
+                    .list_by_asset(&event.asset_id)
+                    .into_iter()
+                    .find(|order| order.id == event.id)
+                    .map(|order| order.size)
+                {
+                    let inferred = (order_size - prev_total).max(0.0);
+                    if inferred > EPSILON {
+                        delta = inferred;
+                        self.override_fill_total(&event.id, order_size).await;
+                    }
+                }
+            }
+        }
+
         if delta > EPSILON {
             if let Err(err) = self.handle_order_fill(event.clone(), delta).await {
                 warn!(
@@ -1737,7 +2010,6 @@ impl ArbitrageStrategy {
             }
         }
 
-        let status = event.status.to_uppercase();
         if matches!(
             status.as_str(),
             "MATCHED" | "CANCELLED" | "CANCELED" | "REJECTED"

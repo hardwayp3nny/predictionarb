@@ -13,6 +13,8 @@ use engine::{
     strategy::Strategy,
     ws_market_multi::MarketMultiWs,
     ws_user::UserWs,
+    ws_user2::UserWsV2,
+    ws_user_combined::CombinedUserStream,
 };
 use prometheus::Registry;
 use serde_json::Value;
@@ -64,6 +66,12 @@ async fn main() -> Result<()> {
         }
         if let Some(timeout_sec) = json_u64(pool_cfg, "connection_timeout") {
             engine_cfg.http.timeout_ms = timeout_sec.saturating_mul(1_000);
+        }
+        if let Some(path) = json_str(pool_cfg, "health_path") {
+            engine_cfg.http.health_path = path.to_string();
+        }
+        if let Some(interval_sec) = json_u64(pool_cfg, "health_interval_secs") {
+            engine_cfg.http.health_interval_ms = interval_sec.saturating_mul(1_000);
         }
     }
 
@@ -119,7 +127,15 @@ async fn main() -> Result<()> {
         )
         .context("create multi market websocket")?,
     );
-    let user_ws = Arc::new(UserWs::new(&engine_cfg.ws.user_ws_url, api_creds.clone()));
+    let user_ws_primary = Arc::new(UserWs::new(&engine_cfg.ws.user_ws_url, api_creds.clone()));
+    let user_ws_secondary = Arc::new(UserWsV2::new(
+        &engine_cfg.ws.user_ws_url_v2,
+        api_creds.clone(),
+    ));
+    let user_ws = Arc::new(CombinedUserStream::new(
+        Arc::clone(&user_ws_primary),
+        Arc::clone(&user_ws_secondary),
+    ));
 
     let metrics = Metrics::new(registry.as_ref());
 

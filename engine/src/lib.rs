@@ -15,6 +15,8 @@ pub mod ws_market;
 pub mod ws_market_multi;
 pub mod ws_parser;
 pub mod ws_user;
+pub mod ws_user2;
+pub mod ws_user_combined;
 // pub mod orders_integration; // temporarily disabled until deps stabilized
 
 pub use config::*;

@@ -19,6 +19,7 @@ reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tungstenite = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 prometheus = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
@@ -29,6 +30,9 @@ async-trait = "0.1"
 num_cpus = "1"
 flate2 = { workspace = true }
 bytes = { workspace = true }
+tokio-rustls = { version = "0.25" }
+webpki-roots = "0.26"
+httparse = "1"
 alloy-signer-local = { version = "0.7", features = ["eip712"] }
 alloy-primitives = "0.8.12"
 alloy-sol-types = { version = "0.8.12", features = ["eip712-serde","json"] }

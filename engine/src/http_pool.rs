@@ -1,6 +1,7 @@
 use crate::config::EngineConfig;
 use anyhow::{Context, Result};
 use flate2::read::{GzDecoder, ZlibDecoder};
+use futures::future::join_all;
 use prometheus::{HistogramVec, IntCounterVec, IntGaugeVec, Registry};
 use reqwest::{
     header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_ENCODING},
@@ -34,7 +35,7 @@ impl HttpPool {
         let client = ClientBuilder::new()
             .http1_only() // Polymarket CLOB is HTTP/1.1; 可按需放开 http2
             .tcp_keepalive(Some(Duration::from_secs(30)))
-            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_idle_timeout(None)
             .pool_max_idle_per_host(http.max_connections)
             .gzip(true)
             .brotli(true)
@@ -44,10 +45,23 @@ impl HttpPool {
             .build()
             .context("build reqwest client")?;
         let base = Url::parse(&http.base_url).context("parse base url")?;
+        let metrics = Arc::new(HttpMetrics::new(registry));
+        let pool = Self {
+            client: client.clone(),
+            base: base.clone(),
+            metrics: Arc::clone(&metrics),
+        };
+
+        pool.spawn_health_monitor(
+            http.health_path.clone(),
+            http.health_interval_ms,
+            http.max_connections,
+        );
+
         Ok(Self {
             client,
             base,
-            metrics: Arc::new(HttpMetrics::new(registry)),
+            metrics,
         })
     }
 
@@ -90,6 +104,90 @@ impl HttpPool {
             }
         }
         h
+    }
+
+    fn spawn_health_monitor(&self, path: String, interval_ms: u64, max_connections: usize) {
+        if interval_ms == 0 {
+            return;
+        }
+
+        let resolved = if path.trim().is_empty() {
+            self.base.clone()
+        } else if path.starts_with('h') {
+            match Url::parse(&path) {
+                Ok(url) => url,
+                Err(err) => {
+                    tracing::warn!(target: "http", ?err, path=%path, "invalid health path");
+                    return;
+                }
+            }
+        } else {
+            match self.base.join(&path) {
+                Ok(url) => url,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "http",
+                        ?err,
+                        base=%self.base,
+                        path=%path,
+                        "failed to resolve health path"
+                    );
+                    return;
+                }
+            }
+        };
+
+        let client = self.client.clone();
+        let url = Arc::new(resolved);
+        tracing::info!(
+            target: "http",
+            path = %url.as_ref(),
+            interval_ms = interval_ms,
+            connections = max_connections,
+            "starting HTTP health monitor"
+        );
+        let headers = Arc::new(self.default_headers());
+        let interval = Duration::from_millis(interval_ms);
+        let label_path = Arc::new(path.clone());
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+
+                let futs = (0..max_connections.max(1)).map(|_| {
+                    let client = client.clone();
+                    let url = Arc::clone(&url);
+                    let headers = headers.as_ref().clone();
+                    let label_path = Arc::clone(&label_path);
+                    async move {
+                        let request = client.get(url.as_ref().clone()).headers(headers);
+                        match request.send().await {
+                            Ok(resp) => {
+                                if let Err(err) = resp.bytes().await {
+                                    tracing::debug!(
+                                        target: "http",
+                                        ?err,
+                                        path = %label_path.as_ref(),
+                                        "health probe read body failed"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    target: "http",
+                                    ?err,
+                                    path = %label_path.as_ref(),
+                                    "health probe request failed"
+                                );
+                            }
+                        }
+                    }
+                });
+
+                join_all(futs).await;
+            }
+        });
     }
 
     pub async fn get(&self, path: &str, headers: Option<HeaderMap>) -> Result<HttpResponse> {
