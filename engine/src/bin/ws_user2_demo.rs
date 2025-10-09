@@ -5,8 +5,7 @@ use tokio::time::{sleep, Duration};
 
 const DEFAULT_API_KEY: &str = "";
 const DEFAULT_API_SECRET: &str = "";
-const DEFAULT_API_PASSPHRASE: &str =
-    "";
+const DEFAULT_API_PASSPHRASE: &str = "";
 
 #[tokio::main]
 async fn main() -> Result<()> {
