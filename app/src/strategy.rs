@@ -1,3 +1,4 @@
+use crate::config::load_config;
 use alloy_primitives::U256;
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{anyhow, Context, Result};
@@ -464,10 +465,8 @@ impl ArbitrageStrategy {
     }
 
     async fn initialize_runtime(&self) -> Result<Vec<String>> {
-        let raw = fs::read(&self.config_path)
-            .await
-            .with_context(|| format!("read config file: {}", self.config_path.display()))?;
-        let cfg: AppConfig = serde_json::from_slice(&raw).context("parse config json")?;
+        let cfg_value = load_config(&self.config_path).await?;
+        let cfg: AppConfig = serde_json::from_value(cfg_value).context("parse config json")?;
 
         let client_cfg = cfg.client.clone();
         let fallback_api_creds = cfg.api_creds.clone().map(ApiCreds::from);

@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
-use app::ArbitrageStrategy;
+use app::{config::load_config, ArbitrageStrategy};
 use engine::{
     auth::{create_or_derive_api_creds, ApiCreds},
     config::EngineConfig,
@@ -18,7 +18,6 @@ use engine::{
 };
 use prometheus::Registry;
 use serde_json::Value;
-use tokio::fs;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -41,10 +40,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "config.json".to_string());
     let config_path = PathBuf::from(config_arg);
 
-    let raw = fs::read(&config_path)
-        .await
-        .with_context(|| format!("read config file: {}", config_path.display()))?;
-    let cfg: Value = serde_json::from_slice(&raw).context("parse config json")?;
+    let cfg: Value = load_config(&config_path).await?;
 
     let client_cfg = cfg
         .get("client_config")
