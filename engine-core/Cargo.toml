@@ -14,3 +14,4 @@ uuid = { workspace = true }
 async-trait = "0.1"
 prometheus = { workspace = true }
 num_cpus = "1"
+serde_json = { workspace = true }

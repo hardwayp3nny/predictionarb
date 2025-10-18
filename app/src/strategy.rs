@@ -1,5 +1,4 @@
 use crate::config::load_config;
-use alloy_primitives::U256;
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -18,10 +17,12 @@ use engine::{
         OrderType, OrderUpdate, Side, UserEvent, UserTrade,
     },
     oms::OrderManager,
-    order_builder::{prepare_signed_order, PreparedOrder},
-    order_types::{CreateOrderOptionsRs, SigType},
-    ports::{ExchangeClient, OrdersSnapshot, PositionsSnapshot},
-    strategy::Strategy,
+    ports::{OrdersSnapshot, PositionsSnapshot},
+};
+use engine_core::model::CreateOrderOptions;
+use engine_core::strategy::{
+    CancelOrderRequest, CancelResult, Counter, OrderResult, PlaceOrderRequest, PrimingRequest,
+    StartAction, Strategy as CoreStrategy, StrategyConfig, StrategyContext,
 };
 use futures::future::{join_all, try_join_all};
 use prometheus::Registry;
@@ -29,20 +30,22 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     convert::TryFrom,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
+use tokio::sync::oneshot;
 use tokio::{
     fs,
     fs::OpenOptions,
     io::AsyncWriteExt,
-    sync::{Mutex, RwLock},
+    sync::{Mutex as AsyncMutex, RwLock},
     time::{sleep, Instant},
 };
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 const BOOKS_BATCH_LIMIT: usize = 200;
 const MIN_ASK_SIZE: f64 = 10.0;
@@ -74,7 +77,7 @@ struct PersistentLogger {
     base_name: String,
     max_files: usize,
     max_bytes: u64,
-    state: Arc<Mutex<LoggerState>>,
+    state: Arc<AsyncMutex<LoggerState>>,
 }
 
 impl PersistentLogger {
@@ -85,7 +88,7 @@ impl PersistentLogger {
             base_name,
             max_files: normalized_max_files,
             max_bytes: max_bytes.max(1),
-            state: Arc::new(Mutex::new(LoggerState {
+            state: Arc::new(AsyncMutex::new(LoggerState {
                 file: None,
                 size: 0,
             })),
@@ -434,7 +437,7 @@ pub struct ArbitrageStrategy {
     config_path: PathBuf,
     runtime: Arc<RwLock<Option<StrategyRuntime>>>,
     preloaded_api_creds: Arc<RwLock<Option<ApiCreds>>>,
-    pending_orders: Arc<RwLock<HashMap<String, PreparedOrder>>>,
+    counter: Arc<RwLock<Option<Arc<dyn Counter>>>>,
     order_fill_tracker: Arc<RwLock<HashMap<String, f64>>>,
     hedge_orders: Arc<RwLock<HashSet<String>>>,
     hedge_order_index: Arc<RwLock<HashMap<String, String>>>,
@@ -444,14 +447,18 @@ pub struct ArbitrageStrategy {
 
 impl ArbitrageStrategy {
     pub fn new<P: Into<PathBuf>>(config_path: P) -> Self {
+        Self::with_creds(config_path.into(), None)
+    }
+
+    fn with_creds(config_path: PathBuf, creds: Option<ApiCreds>) -> Self {
         let logs_dir = PathBuf::from("logs");
         let logger =
             PersistentLogger::new(logs_dir, "strategy.log".to_string(), 10, 10 * 1024 * 1024);
         Self {
-            config_path: config_path.into(),
+            config_path,
             runtime: Arc::new(RwLock::new(None)),
-            preloaded_api_creds: Arc::new(RwLock::new(None)),
-            pending_orders: Arc::new(RwLock::new(HashMap::new())),
+            preloaded_api_creds: Arc::new(RwLock::new(creds)),
+            counter: Arc::new(RwLock::new(None)),
             order_fill_tracker: Arc::new(RwLock::new(HashMap::new())),
             hedge_orders: Arc::new(RwLock::new(HashSet::new())),
             hedge_order_index: Arc::new(RwLock::new(HashMap::new())),
@@ -462,6 +469,14 @@ impl ArbitrageStrategy {
 
     pub async fn set_api_creds(&self, creds: ApiCreds) {
         *self.preloaded_api_creds.write().await = Some(creds);
+    }
+
+    async fn counter(&self) -> Result<Arc<dyn Counter>> {
+        let guard = self.counter.read().await;
+        guard
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow!("counter not initialised"))
     }
 
     async fn initialize_runtime(&self) -> Result<Vec<String>> {
@@ -774,7 +789,7 @@ impl ArbitrageStrategy {
             best_ask: Level,
         }
 
-        let mut prepared_orders: Vec<(String, String)> = Vec::new();
+        let mut order_plans: Vec<(ArbitrageToken, f64, f64)> = Vec::new();
 
         for (group_id, tokens) in combos {
             if blocked_groups.contains(&group_id) {
@@ -920,69 +935,72 @@ impl ArbitrageStrategy {
                     threshold,
                     target_price,
                     order_size,
-                    "preparing buy order"
+                    "queueing buy order"
                 );
-                match self
-                    .build_limit_order(
-                        &token.token_id,
-                        Side::Buy,
-                        target_price,
-                        order_size,
-                        OrderType::Gtc,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(order_id) => {
-                        prepared_orders.push((order_id, token.token_id.clone()));
-                    }
-                    Err(err) => {
-                        warn!(
-                            ?err,
-                            token_id = token.token_id.as_str(),
-                            symbol = token.symbol.as_str(),
-                            "failed to build order"
-                        );
-                    }
-                }
+                order_plans.push((token.clone(), target_price, order_size));
             }
         }
 
-        if prepared_orders.is_empty() {
+        if order_plans.is_empty() {
             return Ok(());
         }
 
-        for chunk in prepared_orders.chunks(POST_BATCH_SIZE) {
-            info!(batch_size = chunk.len(), "submitting order batch");
-            let results = join_all(
-                chunk
-                    .iter()
-                    .map(|(order_id, _)| self.post_order(order_id, "primary")),
-            )
-            .await;
-            for ((order_id, token_id), result) in chunk.iter().zip(results.into_iter()) {
+        let mut queue: VecDeque<(ArbitrageToken, f64, f64)> = order_plans.into();
+        while !queue.is_empty() {
+            let mut batch = Vec::new();
+            for _ in 0..POST_BATCH_SIZE {
+                if let Some(plan) = queue.pop_front() {
+                    batch.push(plan);
+                } else {
+                    break;
+                }
+            }
+
+            if batch.is_empty() {
+                break;
+            }
+
+            info!(batch_size = batch.len(), "submitting order batch");
+            let futures: Vec<_> = batch
+                .into_iter()
+                .map(|(token, price, size)| {
+                    let strategy = self.clone();
+                    let token_id = token.token_id.clone();
+                    async move {
+                        let result = strategy
+                            .submit_limit_order(
+                                token,
+                                Side::Buy,
+                                price,
+                                size,
+                                OrderType::Gtc,
+                                "primary",
+                            )
+                            .await;
+                        (token_id, result)
+                    }
+                })
+                .collect();
+
+            let results = join_all(futures).await;
+            let batch_count = results.len();
+            for (token_id, result) in results.into_iter() {
                 match result {
                     Ok(ack) => {
                         if !ack.success {
                             warn!(
                                 token_id = token_id.as_str(),
-                                order_id = order_id.as_str(),
                                 error = ?ack.error_message,
-                                "order post failed"
+                                "order submission rejected"
                             );
                         }
                     }
                     Err(err) => {
-                        warn!(
-                            ?err,
-                            token_id = token_id.as_str(),
-                            order_id = order_id.as_str(),
-                            "failed to post order"
-                        );
+                        warn!(?err, token_id = token_id.as_str(), "failed to submit order");
                     }
                 }
             }
-            info!(batch_size = chunk.len(), "completed order batch submission");
+            info!(batch_size = batch_count, "completed order batch submission");
         }
 
         Ok(())
@@ -1008,100 +1026,64 @@ impl ArbitrageStrategy {
         }
     }
 
-    pub async fn build_limit_order(
+    async fn submit_limit_order(
         &self,
-        token_identifier: &str,
+        token: ArbitrageToken,
         side: Side,
         price: f64,
         size: f64,
         order_type: OrderType,
-        expiration: Option<u64>,
-    ) -> Result<String> {
-        let prepared = {
-            let guard = self.runtime.read().await;
-            let rt = guard
-                .as_ref()
-                .ok_or_else(|| anyhow!("strategy runtime not initialized"))?;
-            let token = rt
-                .tokens
-                .iter()
-                .find(|t| t.token_id == token_identifier || t.symbol == token_identifier)
-                .cloned()
-                .ok_or_else(|| anyhow!("unknown token: {}", token_identifier))?;
-            let args = OrderArgs {
-                token_id: token.token_id.clone(),
-                price,
-                size,
-                side,
-            };
-            prepare_signed_order(
-                rt.signer.as_ref(),
-                rt.chain_id,
-                args,
-                order_type,
-                CreateOrderOptionsRs {
-                    tick_size: Some(token.tick_size),
-                    neg_risk: Some(token.neg_risk),
-                },
-                expiration.unwrap_or(0),
-                0,
-                U256::from(0u8),
-                "0x0000000000000000000000000000000000000000",
-                rt.browser_address.as_deref(),
-                SigType::PolyGnosisSafe,
-            )?
+        source: &str,
+    ) -> Result<OrderAck> {
+        let args = OrderArgs {
+            token_id: token.token_id.clone(),
+            price,
+            size,
+            side,
         };
 
-        let order_id = prepared.signed.order_id.clone();
-        let mut guard = self.pending_orders.write().await;
-        guard.insert(order_id.clone(), prepared);
-        Ok(order_id)
-    }
-
-    pub async fn post_order(&self, order_id: &str, source: &str) -> Result<OrderAck> {
-        let prepared = {
-            let guard = self.pending_orders.read().await;
-            guard
-                .get(order_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("order {} not prepared", order_id))?
+        let options = CreateOrderOptions {
+            tick_size: Some(token.tick_size),
+            neg_risk: Some(token.neg_risk),
         };
 
-        let (exchange, manager) = {
-            let mut guard = self.runtime.write().await;
-            let rt = guard
-                .as_mut()
-                .ok_or_else(|| anyhow!("strategy runtime not initialized"))?;
-            let mgr = rt.ensure_order_manager(&prepared.args.token_id);
-            (Arc::clone(&rt.exchange), mgr)
-        };
+        let counter = self.counter().await?;
+        let client_order_id = Uuid::new_v4().to_string();
 
-        manager.upsert_pending(prepared.signed.order_id.clone(), &prepared.args);
+        let mut request = PlaceOrderRequest::new(args.clone(), order_type).with_options(options);
+        request = request.with_client_order_id(client_order_id.clone());
 
-        self.log_order_submission_event(&prepared.args, &prepared.signed.order_id, source)
-            .await;
-
-        let submit_result = exchange.submit_prepared_order(&prepared).await;
-        let ack = match submit_result {
-            Ok(ack) => ack,
-            Err(err) => {
-                let mut guard = self.pending_orders.write().await;
-                guard.remove(order_id);
-                return Err(err);
-            }
-        };
-
-        manager.on_ack(&ack);
-
-        {
-            // Always drop the prepared order after we attempt to submit it to avoid unbounded growth.
-            let mut guard = self.pending_orders.write().await;
-            guard.remove(order_id);
-            if let Some(actual) = ack.order_id.as_ref() {
-                if actual != order_id {
-                    guard.remove(actual);
+        let (tx, rx) = oneshot::channel::<OrderResult>();
+        let sender = Arc::new(StdMutex::new(Some(tx)));
+        let callback = {
+            let sender = Arc::clone(&sender);
+            Arc::new(move |result: OrderResult| {
+                if let Some(tx) = sender.lock().unwrap().take() {
+                    let _ = tx.send(result);
                 }
-            }
+            })
+        };
+
+        counter.place_order(request, callback)?;
+
+        let result = rx.await.map_err(|_| anyhow!("order ack channel dropped"))?;
+        let ack = result?;
+
+        if let Some(actual_id) = ack.order_id.clone() {
+            let manager = {
+                let mut guard = self.runtime.write().await;
+                let rt = guard
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("strategy runtime not initialized"))?;
+                rt.ensure_order_manager(&token.token_id)
+            };
+            manager.upsert_pending(actual_id.clone(), &args);
+            manager.on_ack(&ack);
+            self.log_order_submission_event(&args, &actual_id, source)
+                .await;
+        } else {
+            self.log_order_submission_event(&args, &client_order_id, source)
+                .await;
         }
 
         Ok(ack)
@@ -1114,20 +1096,26 @@ impl ArbitrageStrategy {
                 not_canceled: vec![],
             });
         }
-        let exchange = {
-            let guard = self.runtime.read().await;
-            let rt = guard
-                .as_ref()
-                .ok_or_else(|| anyhow!("strategy runtime not initialized"))?;
-            Arc::clone(&rt.exchange)
+
+        let counter = self.counter().await?;
+        let cancel_request = CancelOrderRequest::new(String::new(), ids);
+        let (tx, rx) = oneshot::channel::<CancelResult>();
+        let sender = Arc::new(StdMutex::new(Some(tx)));
+        let callback = {
+            let sender = Arc::clone(&sender);
+            Arc::new(move |result: CancelResult| {
+                if let Some(tx) = sender.lock().unwrap().take() {
+                    let _ = tx.send(result);
+                }
+            })
         };
-        let ack = exchange.cancel_orders(ids.clone()).await?;
-        if !ack.canceled.is_empty() {
-            let mut guard = self.pending_orders.write().await;
-            for id in &ack.canceled {
-                guard.remove(id);
-            }
-        }
+
+        counter.cancel_orders(cancel_request, callback)?;
+
+        let result = rx
+            .await
+            .map_err(|_| anyhow!("cancel ack channel dropped"))?;
+        let ack = result?;
         Ok(ack)
     }
 
@@ -1609,64 +1597,44 @@ impl ArbitrageStrategy {
     async fn execute_hedge_orders(&self, group_id: &str, plans: Vec<HedgeOrderPlan>) -> Result<()> {
         let mut registered: Vec<(String, String, f64)> = Vec::new();
 
-        let mut built_orders: Vec<(String, HedgeOrderPlan)> = Vec::new();
-        for plan in plans.iter() {
+        for plan in plans.into_iter() {
             match self
-                .build_limit_order(
-                    &plan.token.token_id,
+                .submit_limit_order(
+                    plan.token.clone(),
                     Side::Buy,
                     plan.price,
                     plan.size,
                     OrderType::Gtc,
-                    None,
+                    "hedge",
                 )
                 .await
             {
-                Ok(id) => built_orders.push((id, plan.clone())),
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        token_id = plan.token.token_id.as_str(),
-                        "failed to build hedge order"
-                    );
-                    return Ok(());
-                }
-            }
-        }
-
-        if built_orders.is_empty() {
-            return Ok(());
-        }
-
-        let results = join_all(
-            built_orders
-                .iter()
-                .map(|(order_id, _)| self.post_order(order_id, "hedge")),
-        )
-        .await;
-
-        for ((order_id, plan), result) in built_orders.into_iter().zip(results.into_iter()) {
-            match result {
                 Ok(ack) => {
                     if !ack.success {
                         warn!(
                             token_id = plan.token.token_id.as_str(),
-                            order_id = order_id.as_str(),
                             error = ?ack.error_message,
                             "hedge order rejected"
                         );
                         self.handle_group_timeout(group_id).await?;
                         return Ok(());
                     }
-                    let actual_id = ack.order_id.clone().unwrap_or(order_id.clone());
-                    registered.push((actual_id, plan.token.token_id.clone(), plan.size));
+                    if let Some(actual_id) = ack.order_id.clone() {
+                        registered.push((actual_id, plan.token.token_id.clone(), plan.size));
+                    } else {
+                        warn!(
+                            token_id = plan.token.token_id.as_str(),
+                            "hedge order ack missing id"
+                        );
+                        self.handle_group_timeout(group_id).await?;
+                        return Ok(());
+                    }
                 }
                 Err(err) => {
                     warn!(
                         ?err,
                         token_id = plan.token.token_id.as_str(),
-                        order_id = order_id.as_str(),
-                        "failed to post hedge order"
+                        "failed to submit hedge order"
                     );
                     self.handle_group_timeout(group_id).await?;
                     return Ok(());
@@ -1915,12 +1883,8 @@ impl ArbitrageStrategy {
             status.as_str(),
             "MATCHED" | "CANCELLED" | "CANCELED" | "REJECTED"
         ) {
-            let mut guard = self.pending_orders.write().await;
-            guard.remove(&event.id);
-            {
-                let mut tracker = self.order_fill_tracker.write().await;
-                tracker.remove(&event.id);
-            }
+            let mut tracker = self.order_fill_tracker.write().await;
+            tracker.remove(&event.id);
             self.remove_hedge_tracking(&event.id).await;
         }
     }
@@ -1934,30 +1898,74 @@ impl ArbitrageStrategy {
 }
 
 #[async_trait]
-impl Strategy for ArbitrageStrategy {
-    async fn on_start(&self) -> Vec<String> {
+impl CoreStrategy for ArbitrageStrategy {
+    fn new(config: StrategyConfig) -> Result<Self> {
+        let raw = config.raw().clone();
+        let config_path = raw
+            .get("config_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("config_path missing"))?
+            .to_string();
+
+        let creds = raw
+            .get("api_creds")
+            .and_then(|value| serde_json::from_value::<ApiCredsConfig>(value.clone()).ok())
+            .map(ApiCreds::from);
+
+        Ok(Self::with_creds(PathBuf::from(config_path), creds))
+    }
+
+    async fn on_start(&mut self, ctx: &StrategyContext) -> Result<StartAction> {
+        {
+            let mut guard = self.counter.write().await;
+            *guard = Some(ctx.counter());
+        }
+
         match self.initialize_runtime().await {
-            Ok(asset_ids) => asset_ids,
+            Ok(asset_ids) => Ok(StartAction {
+                subscribe_tokens: asset_ids,
+                subscribe_user_stream: true,
+                priming_requests: vec![
+                    PrimingRequest::SyncOpenOrders,
+                    PrimingRequest::SyncPositions,
+                ],
+            }),
             Err(err) => {
                 error!(?err, "arbitrage strategy initialization failed");
-                Vec::new()
+                Err(err)
             }
         }
     }
 
-    async fn on_order_book(&self, event: OrderBook) {
-        self.handle_order_book(event).await;
+    fn on_order_book(&mut self, event: &OrderBook) {
+        let snapshot = event.clone();
+        let strategy = self.clone();
+        tokio::spawn(async move {
+            strategy.handle_order_book(snapshot).await;
+        });
     }
 
-    async fn on_depth_update(&self, event: DepthUpdate) {
-        self.handle_depth_update(event).await;
+    fn on_depth_update(&mut self, event: &DepthUpdate) {
+        let update = event.clone();
+        let strategy = self.clone();
+        tokio::spawn(async move {
+            strategy.handle_depth_update(update).await;
+        });
     }
 
-    async fn on_order_update(&self, event: OrderUpdate) {
-        self.handle_order_update(event).await;
+    fn on_order_update(&mut self, event: &OrderUpdate) {
+        let update = event.clone();
+        let strategy = self.clone();
+        tokio::spawn(async move {
+            strategy.handle_order_update(update).await;
+        });
     }
 
-    async fn on_user_trade(&self, event: UserTrade) {
-        self.handle_user_trade(event).await;
+    fn on_user_trade(&mut self, event: &UserTrade) {
+        let trade = event.clone();
+        let strategy = self.clone();
+        tokio::spawn(async move {
+            strategy.handle_user_trade(trade).await;
+        });
     }
 }

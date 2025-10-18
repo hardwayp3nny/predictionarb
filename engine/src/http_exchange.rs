@@ -4,7 +4,7 @@ use crate::{
     model::*,
     order_builder::{build_signed_order, PreparedOrder},
     order_types::{CreateOrderOptionsRs, SigType},
-    ports::ExchangeClient,
+    ports::{BooksSnapshot, ExchangeClient},
 };
 use alloy_primitives::U256;
 use alloy_signer_local::PrivateKeySigner;
@@ -649,6 +649,13 @@ impl crate::ports::PositionsSnapshot for PolymarketHttpExchange {
             // We don't change struct here to avoid ripple; currentValue will be used by caller via raw json if needed
         }
         Ok(out)
+    }
+}
+
+#[async_trait]
+impl BooksSnapshot for PolymarketHttpExchange {
+    async fn fetch_books(&self, token_ids: &[String]) -> Result<Vec<BookSnapshot>> {
+        self.fetch_books(token_ids).await
     }
 }
 

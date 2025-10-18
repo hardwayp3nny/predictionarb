@@ -9,13 +9,13 @@ use engine::{
     http_exchange::PolymarketHttpExchange,
     http_pool::HttpPool,
     metrics::Metrics,
-    runner::Engine,
-    strategy::Strategy,
+    strategy_runner::StrategyRunner,
     ws_market_multi::MarketMultiWs,
     ws_user::UserWs,
     ws_user2::UserWsV2,
     ws_user_combined::CombinedUserStream,
 };
+use engine_core::strategy::StrategyConfig;
 use prometheus::Registry;
 use serde_json::Value;
 use tracing::info;
@@ -105,9 +105,6 @@ async fn main() -> Result<()> {
         }
     };
 
-    let strategy_impl = Arc::new(ArbitrageStrategy::new(config_path.clone()));
-    strategy_impl.set_api_creds(api_creds.clone()).await;
-
     let exchange = Arc::new(PolymarketHttpExchange::new(
         http_pool.clone(),
         signer,
@@ -135,9 +132,23 @@ async fn main() -> Result<()> {
 
     let metrics = Metrics::new(registry.as_ref());
 
-    let engine = Engine::new(engine_cfg, exchange, market_ws, user_ws, metrics)
-        .with_strategy(strategy_impl.clone() as Arc<dyn Strategy>);
+    let runner = StrategyRunner::new(
+        engine_cfg,
+        exchange,
+        market_ws,
+        user_ws,
+        Arc::clone(&metrics),
+    );
 
-    Arc::new(engine).run().await?;
+    let strategy_config = StrategyConfig::new(serde_json::json!({
+        "config_path": config_path.to_string_lossy(),
+        "api_creds": {
+            "api_key": api_creds.api_key,
+            "api_secret": api_creds.secret,
+            "api_passphrase": api_creds.passphrase,
+        }
+    }));
+
+    runner.run::<ArbitrageStrategy>(strategy_config).await?;
     Ok(())
 }

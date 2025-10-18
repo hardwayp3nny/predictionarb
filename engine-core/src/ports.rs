@@ -36,6 +36,11 @@ pub trait PositionsSnapshot: Send + Sync {
     async fn fetch_positions(&self) -> anyhow::Result<Vec<UserPosition>>;
 }
 
+#[async_trait]
+pub trait BooksSnapshot: Send + Sync {
+    async fn fetch_books(&self, token_ids: &[String]) -> anyhow::Result<Vec<BookSnapshot>>;
+}
+
 // no blanket impl; concrete exchanges should implement
 
 #[async_trait]

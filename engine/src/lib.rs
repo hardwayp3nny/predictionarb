@@ -15,10 +15,13 @@ pub mod ws_user2;
 pub mod ws_user_combined;
 // pub mod orders_integration; // temporarily disabled until deps stabilized
 
+pub mod counter;
+pub mod strategy_runner;
+
 pub use engine_core::*;
 pub use engine_core::{config, math, metrics, model, order_types, ports};
 pub use oms::*;
 pub use runner::*;
-pub use strategy::*;
+pub use strategy::Strategy;
 pub use ws_activity::*;
 pub use ws_market_multi::*;

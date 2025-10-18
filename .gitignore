@@ -1,3 +1,5 @@
+logs/
+atlas/
 target/
 Cargo.lock
 config.json
