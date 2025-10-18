@@ -1089,6 +1089,115 @@ impl ArbitrageStrategy {
         Ok(ack)
     }
 
+    fn submit_hedge_order_no_wait(
+        &self,
+        token: ArbitrageToken,
+        price: f64,
+        size: f64,
+        group_id: String,
+    ) -> Result<()> {
+        let args = OrderArgs {
+            token_id: token.token_id.clone(),
+            price,
+            size,
+            side: Side::Buy,
+        };
+
+        let options = CreateOrderOptions {
+            tick_size: Some(token.tick_size),
+            neg_risk: Some(token.neg_risk),
+        };
+
+        let counter = {
+            let guard = self.counter.blocking_read();
+            guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("counter not initialised"))?
+                .clone()
+        };
+
+        let client_order_id = Uuid::new_v4().to_string();
+        let mut request = PlaceOrderRequest::new(args.clone(), OrderType::Gtc).with_options(options);
+        request = request.with_client_order_id(client_order_id.clone());
+
+        let strategy = self.clone();
+        let token_id_for_log = token.token_id.clone();
+        let callback = Arc::new(move |result: OrderResult| {
+            let strategy = strategy.clone();
+            let group_id = group_id.clone();
+            let token_id = token_id_for_log.clone();
+            let args = args.clone();
+            let client_order_id = client_order_id.clone();
+            
+            tokio::spawn(async move {
+                match result {
+                    Ok(ack) => {
+                        if !ack.success {
+                            warn!(
+                                token_id = token_id.as_str(),
+                                error = ?ack.error_message,
+                                "hedge order rejected"
+                            );
+                            if let Err(err) = strategy.handle_group_timeout(&group_id).await {
+                                warn!(?err, group_id = group_id.as_str(), "failed to handle timeout after hedge rejection");
+                            }
+                            return;
+                        }
+
+                        let order_id = if let Some(actual_id) = ack.order_id.clone() {
+                            let manager = strategy.ensure_order_manager(&token_id).await;
+                            if let Some(mgr) = manager {
+                                mgr.upsert_pending(actual_id.clone(), &args);
+                                mgr.on_ack(&ack);
+                            }
+                            actual_id
+                        } else {
+                            warn!(token_id = token_id.as_str(), "hedge order ack missing id");
+                            if let Err(err) = strategy.handle_group_timeout(&group_id).await {
+                                warn!(?err, group_id = group_id.as_str(), "failed to handle timeout after missing order id");
+                            }
+                            return;
+                        };
+
+                        strategy.register_hedge_order(&group_id, &order_id, size).await;
+
+                        let symbol = strategy
+                            .token_symbol(&token_id)
+                            .await
+                            .unwrap_or_else(|| token_id.clone());
+                        let entry = json!({
+                            "type": "order_submit",
+                            "timestamp_ms": current_timestamp_ms(),
+                            "order_id": order_id,
+                            "token_id": token_id,
+                            "symbol": symbol,
+                            "side": "BUY",
+                            "price": price,
+                            "size": size,
+                            "source": "hedge",
+                        });
+                        if let Err(err) = strategy.logger.log_json(entry).await {
+                            warn!(?err, order_id = order_id.as_str(), "failed to write hedge order log");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            token_id = token_id.as_str(),
+                            "failed to submit hedge order"
+                        );
+                        if let Err(err) = strategy.handle_group_timeout(&group_id).await {
+                            warn!(?err, group_id = group_id.as_str(), "failed to handle timeout after hedge error");
+                        }
+                    }
+                }
+            });
+        });
+
+        counter.place_order(request, callback)?;
+        Ok(())
+    }
+
     pub async fn cancel_orders(&self, ids: Vec<String>) -> Result<CancelAck> {
         if ids.is_empty() {
             return Ok(CancelAck {
@@ -1591,70 +1700,33 @@ impl ArbitrageStrategy {
         }
 
         self.execute_hedge_orders(&trigger_token.neg_risk_id, plans)
-            .await
     }
 
-    async fn execute_hedge_orders(&self, group_id: &str, plans: Vec<HedgeOrderPlan>) -> Result<()> {
-        let mut registered: Vec<(String, String, f64)> = Vec::new();
-
-        for plan in plans.into_iter() {
-            match self
-                .submit_limit_order(
-                    plan.token.clone(),
-                    Side::Buy,
-                    plan.price,
-                    plan.size,
-                    OrderType::Gtc,
-                    "hedge",
-                )
-                .await
-            {
-                Ok(ack) => {
-                    if !ack.success {
-                        warn!(
-                            token_id = plan.token.token_id.as_str(),
-                            error = ?ack.error_message,
-                            "hedge order rejected"
-                        );
-                        self.handle_group_timeout(group_id).await?;
-                        return Ok(());
-                    }
-                    if let Some(actual_id) = ack.order_id.clone() {
-                        registered.push((actual_id, plan.token.token_id.clone(), plan.size));
-                    } else {
-                        warn!(
-                            token_id = plan.token.token_id.as_str(),
-                            "hedge order ack missing id"
-                        );
-                        self.handle_group_timeout(group_id).await?;
-                        return Ok(());
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        token_id = plan.token.token_id.as_str(),
-                        "failed to submit hedge order"
-                    );
-                    self.handle_group_timeout(group_id).await?;
-                    return Ok(());
-                }
-            }
-        }
-
-        if registered.is_empty() {
+    fn execute_hedge_orders(&self, group_id: &str, plans: Vec<HedgeOrderPlan>) -> Result<()> {
+        if plans.is_empty() {
             return Ok(());
         }
 
-        for (order_id, _, expected) in &registered {
-            self.register_hedge_order(group_id, order_id, *expected)
-                .await;
+        let order_count = plans.len();
+        for plan in plans.into_iter() {
+            if let Err(err) = self.submit_hedge_order_no_wait(
+                plan.token,
+                plan.price,
+                plan.size,
+                group_id.to_string(),
+            ) {
+                warn!(
+                    ?err,
+                    group_id = group_id,
+                    "failed to submit hedge order"
+                );
+            }
         }
 
         info!(
             group_id = group_id,
-            hedge_orders = registered.len(),
-            "submitted hedge orders"
+            hedge_orders = order_count,
+            "submitted hedge orders (fire-and-forget)"
         );
         Ok(())
     }
