@@ -274,6 +274,14 @@ fn parse_trade_obj(obj: &serde_json::Map<String, Value>) -> Option<MarketEvent> 
         .and_then(|v| v.as_str())
         .map(parse_side)
         .unwrap_or(Side::Buy);
+    let hash = obj
+        .get("hash")
+        .or_else(|| obj.get("trade_hash"))
+        .or_else(|| obj.get("tradeHash"))
+        .or_else(|| obj.get("transaction_hash"))
+        .or_else(|| obj.get("transactionHash"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let ts = to_i64(obj.get("timestamp"));
     Some(MarketEvent::PublicTrade(PublicTrade {
         event_type: "last_trade_price".into(),
@@ -283,6 +291,7 @@ fn parse_trade_obj(obj: &serde_json::Map<String, Value>) -> Option<MarketEvent> 
         side,
         size,
         timestamp: ts,
+        hash,
     }))
 }
 
