@@ -1,3 +1,5 @@
 target/
 Cargo.lock
 config.json
+private_key_export.txt
+recordings/
