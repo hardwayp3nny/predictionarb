@@ -1089,7 +1089,7 @@ impl ArbitrageStrategy {
         Ok(ack)
     }
 
-    fn submit_hedge_order_no_wait(
+    async fn submit_hedge_order_no_wait(
         &self,
         token: ArbitrageToken,
         price: f64,
@@ -1108,13 +1108,7 @@ impl ArbitrageStrategy {
             neg_risk: Some(token.neg_risk),
         };
 
-        let counter = {
-            let guard = self.counter.blocking_read();
-            guard
-                .as_ref()
-                .ok_or_else(|| anyhow!("counter not initialised"))?
-                .clone()
-        };
+        let counter = self.counter().await?;
 
         let client_order_id = Uuid::new_v4().to_string();
         let mut request = PlaceOrderRequest::new(args.clone(), OrderType::Gtc).with_options(options);
@@ -1699,29 +1693,38 @@ impl ArbitrageStrategy {
             return Ok(());
         }
 
-        self.execute_hedge_orders(&trigger_token.neg_risk_id, plans)
+        self.execute_hedge_orders(&trigger_token.neg_risk_id, plans).await
     }
 
-    fn execute_hedge_orders(&self, group_id: &str, plans: Vec<HedgeOrderPlan>) -> Result<()> {
+    async fn execute_hedge_orders(&self, group_id: &str, plans: Vec<HedgeOrderPlan>) -> Result<()> {
         if plans.is_empty() {
             return Ok(());
         }
 
         let order_count = plans.len();
-        for plan in plans.into_iter() {
-            if let Err(err) = self.submit_hedge_order_no_wait(
-                plan.token,
-                plan.price,
-                plan.size,
-                group_id.to_string(),
-            ) {
-                warn!(
-                    ?err,
-                    group_id = group_id,
-                    "failed to submit hedge order"
-                );
-            }
-        }
+        let futures: Vec<_> = plans
+            .into_iter()
+            .map(|plan| {
+                let strategy = self.clone();
+                let group_id = group_id.to_string();
+                async move {
+                    if let Err(err) = strategy.submit_hedge_order_no_wait(
+                        plan.token,
+                        plan.price,
+                        plan.size,
+                        group_id.clone(),
+                    ).await {
+                        warn!(
+                            ?err,
+                            group_id = group_id.as_str(),
+                            "failed to submit hedge order"
+                        );
+                    }
+                }
+            })
+            .collect();
+        
+        join_all(futures).await;
 
         info!(
             group_id = group_id,
@@ -1923,18 +1926,20 @@ impl ArbitrageStrategy {
         let (mut delta, prev_total) = self.record_fill_delta(&event.id, event.size_matched).await;
         let status = event.status.to_uppercase();
 
-        if delta <= EPSILON && status == "MATCHED" {
-            if let Some(ref mgr) = manager {
-                if let Some(order_size) = mgr
-                    .list_by_asset(&event.asset_id)
-                    .into_iter()
-                    .find(|order| order.id == event.id)
-                    .map(|order| order.size)
-                {
-                    let inferred = (order_size - prev_total).max(0.0);
-                    if inferred > EPSILON {
-                        delta = inferred;
-                        self.override_fill_total(&event.id, order_size).await;
+        if status == "MATCHED" && event.size_matched > EPSILON {
+            if delta <= EPSILON {
+                if let Some(ref mgr) = manager {
+                    if let Some(order_size) = mgr
+                        .list_by_asset(&event.asset_id)
+                        .into_iter()
+                        .find(|order| order.id == event.id)
+                        .map(|order| order.size)
+                    {
+                        let inferred = (order_size - prev_total).max(0.0);
+                        if inferred > EPSILON {
+                            delta = inferred;
+                            self.override_fill_total(&event.id, order_size).await;
+                        }
                     }
                 }
             }
