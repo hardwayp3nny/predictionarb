@@ -42,3 +42,4 @@ base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
 engine-core = { path = "../engine-core" }
+urlencoding = "2"
