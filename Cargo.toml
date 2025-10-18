@@ -3,6 +3,7 @@ members = [
     "engine-core",
     "engine",
     "app",
+    "tui",
 ]
 resolver = "2"
 
