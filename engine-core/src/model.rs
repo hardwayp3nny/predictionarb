@@ -71,6 +71,37 @@ pub struct OpenOrder {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PositionInfo {
+    #[serde(default)]
+    pub proxy_wallet: String,
+    #[serde(rename = "asset")]
+    pub asset_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub outcome_index: Option<u32>,
+    #[serde(default)]
+    pub size: f64,
+    #[serde(default)]
+    pub avg_price: Option<f64>,
+    #[serde(default)]
+    pub initial_value: Option<f64>,
+    #[serde(default)]
+    pub current_value: Option<f64>,
+    #[serde(default)]
+    pub cur_price: Option<f64>,
+    #[serde(default)]
+    pub cash_pnl: Option<f64>,
+    #[serde(default)]
+    pub percent_pnl: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Level {
     pub price: f64,
     pub size: f64,
@@ -133,6 +164,30 @@ pub struct PublicTrade {
     pub side: Side,
     pub size: f64,
     pub timestamp: TimestampMs,
+    pub hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityEvent {
+    pub asset: String,
+    pub bio: String,
+    pub condition_id: String,
+    pub event_slug: String,
+    pub icon: String,
+    pub name: String,
+    pub outcome: String,
+    pub outcome_index: Option<usize>,
+    pub price: f64,
+    pub profile_image: String,
+    pub proxy_wallet: String,
+    pub pseudonym: String,
+    pub side: Side,
+    pub size: f64,
+    pub usdc_size: Option<f64>,
+    pub slug: String,
+    pub timestamp: TimestampMs,
+    pub title: String,
+    pub transaction_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

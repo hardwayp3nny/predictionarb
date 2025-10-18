@@ -51,6 +51,12 @@ pub trait UserStream: Send + Sync {
 }
 
 #[async_trait]
+pub trait ActivityStream: Send + Sync {
+    async fn connect(&self) -> anyhow::Result<()>;
+    async fn next(&self) -> anyhow::Result<Option<ActivityEvent>>;
+}
+
+#[async_trait]
 pub trait OrderStore: Send + Sync {
     async fn on_ack(&self, ack: &OrderAck);
     async fn on_user_event(&self, ev: &UserEvent);

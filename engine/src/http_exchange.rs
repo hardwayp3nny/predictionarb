@@ -12,7 +12,9 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use urlencoding::encode;
 
 fn parse_f64_field(value: Option<&Value>) -> Result<f64> {
     let val = value.ok_or_else(|| anyhow!("missing number field"))?;
@@ -447,95 +449,125 @@ impl ExchangeClient for PolymarketHttpExchange {
     }
 
     async fn get_orders(&self) -> Result<Vec<OpenOrder>> {
-        // GET /data/orders with L2 headers
-        let headers = create_l2_headers(&self.signer, &self.creds, "GET", "/data/orders", None)?;
-        let resp = self.pool.get("/data/orders", Some(headers)).await?;
         let mut out = Vec::new();
-        if let Some(js) = resp.json {
-            let arr = js
-                .get("data")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for it in arr.into_iter() {
-                let id = it
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if id.is_empty() {
-                    continue;
+        let mut seen = HashSet::<String>::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let path = if let Some(cur) = cursor.as_ref() {
+                format!("/data/orders?next_cursor={}&geo_block_token=", encode(cur))
+            } else {
+                "/data/orders".to_string()
+            };
+
+            let headers = create_l2_headers(&self.signer, &self.creds, "GET", &path, None)?;
+            let resp = self.pool.get(&path, Some(headers)).await?;
+            let mut page_added = 0usize;
+
+            if let Some(js) = resp.json {
+                let arr = js
+                    .get("data")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                for it in arr.into_iter() {
+                    let id = it
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if id.is_empty() || !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    let asset_id = it
+                        .get("asset_id")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| it.get("market").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                        .to_string();
+                    let market = it
+                        .get("market")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let price = it
+                        .get("price")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .or_else(|| it.get("price").and_then(|v| v.as_f64()))
+                        .unwrap_or(0.0);
+                    let size = it
+                        .get("original_size")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .or_else(|| {
+                            it.get("size")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                        })
+                        .or_else(|| it.get("original_size").and_then(|v| v.as_f64()))
+                        .or_else(|| it.get("size").and_then(|v| v.as_f64()))
+                        .unwrap_or(0.0);
+                    let size_matched = it
+                        .get("size_matched")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .or_else(|| it.get("size_matched").and_then(|v| v.as_f64()))
+                        .unwrap_or(0.0);
+                    let side_s = it
+                        .get("side")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_uppercase();
+                    let side = if side_s == "BUY" {
+                        Side::Buy
+                    } else {
+                        Side::Sell
+                    };
+                    let status_s = it
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_uppercase();
+                    let status = match status_s.as_str() {
+                        "LIVE" => OrderStatus::Live,
+                        "MATCHED" => OrderStatus::Matched,
+                        "PENDING_NEW" => OrderStatus::PendingNew,
+                        "CANCELLED" | "CANCELED" => OrderStatus::Cancelled,
+                        "REJECTED" => OrderStatus::Rejected,
+                        _ => OrderStatus::Live,
+                    };
+                    let created_at = it.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
+                    out.push(OpenOrder {
+                        id,
+                        status,
+                        market,
+                        size,
+                        price,
+                        side,
+                        size_matched,
+                        asset_id,
+                        created_at,
+                    });
+                    page_added += 1;
                 }
-                let asset_id = it
-                    .get("asset_id")
+
+                cursor = js
+                    .get("next_cursor")
                     .and_then(|v| v.as_str())
-                    .or_else(|| it.get("market").and_then(|v| v.as_str()))
-                    .unwrap_or("")
-                    .to_string();
-                let market = it
-                    .get("market")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let price = it
-                    .get("price")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| it.get("price").and_then(|v| v.as_f64()))
-                    .unwrap_or(0.0);
-                let size = it
-                    .get("original_size")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| {
-                        it.get("size")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| s.parse::<f64>().ok())
-                    })
-                    .or_else(|| it.get("original_size").and_then(|v| v.as_f64()))
-                    .or_else(|| it.get("size").and_then(|v| v.as_f64()))
-                    .unwrap_or(0.0);
-                let size_matched = it
-                    .get("size_matched")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| it.get("size_matched").and_then(|v| v.as_f64()))
-                    .unwrap_or(0.0);
-                let side_s = it
-                    .get("side")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_uppercase();
-                let side = if side_s == "BUY" {
-                    Side::Buy
-                } else {
-                    Side::Sell
-                };
-                let status_s = it
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_uppercase();
-                let status = match status_s.as_str() {
-                    "LIVE" => OrderStatus::Live,
-                    "MATCHED" => OrderStatus::Matched,
-                    "PENDING_NEW" => OrderStatus::PendingNew,
-                    "CANCELLED" | "CANCELED" => OrderStatus::Cancelled,
-                    "REJECTED" => OrderStatus::Rejected,
-                    _ => OrderStatus::Live,
-                };
-                let created_at = it.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
-                out.push(OpenOrder {
-                    id,
-                    status,
-                    market,
-                    size,
-                    price,
-                    side,
-                    size_matched,
-                    asset_id,
-                    created_at,
-                });
+                    .and_then(|s| {
+                        if s.is_empty() || s == "LTE=" {
+                            None
+                        } else {
+                            Some(s.to_string())
+                        }
+                    });
+            } else {
+                cursor = None;
+            }
+
+            if page_added == 0 || cursor.is_none() {
+                break;
             }
         }
         Ok(out)
@@ -615,6 +647,38 @@ impl crate::ports::PositionsSnapshot for PolymarketHttpExchange {
             // let current_value = p.get("currentValue").and_then(|v| v.as_f64());
             out.push(UserPosition { asset_id, size });
             // We don't change struct here to avoid ripple; currentValue will be used by caller via raw json if needed
+        }
+        Ok(out)
+    }
+}
+
+impl PolymarketHttpExchange {
+    fn wallet_address(&self) -> String {
+        if let Some(a) = self.maker_override.as_ref() {
+            a.clone()
+        } else {
+            use alloy_primitives::hex::encode_prefixed;
+            encode_prefixed(self.signer.address().as_slice())
+        }
+    }
+
+    pub async fn fetch_positions_detail(&self) -> Result<Vec<PositionInfo>> {
+        let addr = self.wallet_address();
+        let url = format!(
+            "https://data-api.polymarket.com/positions?user={}&sizeThreshold=.1&limit=500&offset=0&sortBy=CURRENT&sortDirection=DESC",
+            addr
+        );
+        let resp = self.pool.get(&url, None).await?;
+        let items = resp
+            .json
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(items.len());
+        for item in items.into_iter() {
+            let info: PositionInfo = serde_json::from_value(item)?;
+            out.push(info);
         }
         Ok(out)
     }
