@@ -1926,20 +1926,18 @@ impl ArbitrageStrategy {
         let (mut delta, prev_total) = self.record_fill_delta(&event.id, event.size_matched).await;
         let status = event.status.to_uppercase();
 
-        if status == "MATCHED" && event.size_matched > EPSILON {
-            if delta <= EPSILON {
-                if let Some(ref mgr) = manager {
-                    if let Some(order_size) = mgr
-                        .list_by_asset(&event.asset_id)
-                        .into_iter()
-                        .find(|order| order.id == event.id)
-                        .map(|order| order.size)
-                    {
-                        let inferred = (order_size - prev_total).max(0.0);
-                        if inferred > EPSILON {
-                            delta = inferred;
-                            self.override_fill_total(&event.id, order_size).await;
-                        }
+        if delta <= EPSILON && status == "MATCHED" {
+            if let Some(ref mgr) = manager {
+                if let Some(order_size) = mgr
+                    .list_by_asset(&event.asset_id)
+                    .into_iter()
+                    .find(|order| order.id == event.id)
+                    .map(|order| order.size)
+                {
+                    let inferred = (order_size - prev_total).max(0.0);
+                    if inferred > EPSILON {
+                        delta = inferred;
+                        self.override_fill_total(&event.id, order_size).await;
                     }
                 }
             }

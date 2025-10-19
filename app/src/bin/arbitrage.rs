@@ -72,6 +72,30 @@ async fn main() -> Result<()> {
     }
 
     let registry = Arc::new(Registry::new());
+    
+    let metrics_registry = Arc::clone(&registry);
+    tokio::spawn(async move {
+        use prometheus::{Encoder, TextEncoder};
+        use warp::Filter;
+        
+        let metrics_route = warp::path!("metrics").map(move || {
+            let encoder = TextEncoder::new();
+            let metric_families = metrics_registry.gather();
+            let mut buffer = vec![];
+            encoder.encode(&metric_families, &mut buffer).unwrap();
+            warp::reply::with_header(
+                String::from_utf8(buffer).unwrap(),
+                "content-type",
+                "text/plain; version=0.0.4",
+            )
+        });
+        
+        info!("Prometheus metrics server listening on http://0.0.0.0:9090/metrics");
+        warp::serve(metrics_route)
+            .run(([0, 0, 0, 0], 9090))
+            .await;
+    });
+    
     let http_pool =
         Arc::new(HttpPool::new(&engine_cfg, registry.as_ref()).context("create http pool")?);
 
